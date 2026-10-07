@@ -169,7 +169,11 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         encoded = name.encode()
         client.sendall(struct.pack("!IHHHH", MAGIC, 2, TOKEN_LENGTH, columns, rows) +
                        self.token.encode() + struct.pack("!BB", role, len(encoded)) + encoded)
-        accepted = client.recv(1)
+        try:
+            accepted = client.recv(1)
+        except ConnectionError:
+            client.close()
+            return None
         if accepted != b"\x06":
             client.close()
             return None
