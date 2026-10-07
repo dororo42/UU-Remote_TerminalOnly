@@ -976,6 +976,7 @@ static int anchor_session(const char *token, uint16_t port, const char *name)
     trace_event("anchor_held");
     while (recv(anchor, discard, sizeof(discard), 0) > 0)
         ;
+    trace_error("anchor_recv_ended", WSAGetLastError());
     closesocket(anchor);
     trace_event("anchor_released");
     return 1;

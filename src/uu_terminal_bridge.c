@@ -626,7 +626,12 @@ static int hold_session(int listener, int client, const struct handshake *handsh
         }
         if (anchored && anchor_count == 0) {
             fprintf(stderr, "terminal session anchor closed name=%s\n", handshake->name);
-            break;
+            /* A viewer that is still attached keeps the session alive: the
+             * pane process can disappear (controller-driven tree cleanup)
+             * without the terminal being closed. */
+            if (attach < 0)
+                break;
+            anchored = 0;
         }
         if (!anchored && attach < 0)
             break;
