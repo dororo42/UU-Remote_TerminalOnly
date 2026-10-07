@@ -1,0 +1,5 @@
+# Pinned public input SDK headers
+
+Exact unchanged FreeRDP/WinPR public-header bytes from upstream commit a8f1b46b0486b79e986d69530685af144268a9d0 (Apache-2.0; LICENSE retained), plus the exact configured generated config/version/settings_keys headers matching the independently audited input adapter ABI. This is headers only: no FreeRDP library or alternative runtime is linked/loaded. Build validation hard-pins manifest bytes and each header. Dynamic exports/context ABI are still validated against the original installed SDL/FreeRDP runtime before input effects.
+
+The 261 files retain their upstream copyright/license notices. Two unused build-config.h files are intentionally excluded; they contain build installation directories and are not included by this plugin's public-header dependency graph. Their original263 inventory and configured-header source provenance are retained in private preparation evidence. Actual compiler dependency receipt remains required to confirm this exclusion before adoption. No header content or ABI declaration is rewritten.

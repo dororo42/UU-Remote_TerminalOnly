@@ -1373,6 +1373,14 @@ install_terminal_conpty_shim() {
     if /usr/bin/cmp -s "$terminal_conpty_dll" "$terminal_shim_compat"; then
         return 0
     fi
+    if [[ -f "$terminal_conpty_vendor" ]]; then
+        # The vendor backup proves this file is shim-managed: upgrade in
+        # place (rebuilds of the shim are not byte-identical).
+        /usr/bin/install -m 0644 "$terminal_shim_compat" \
+            "${terminal_conpty_dll}.tmp" &&
+            mv -f -- "${terminal_conpty_dll}.tmp" "$terminal_conpty_dll"
+        return 0
+    fi
     if ! LC_ALL=C /usr/bin/grep -aq 'ConptyCreatePseudoConsoleAsUser' \
             "$terminal_conpty_dll" 2>/dev/null; then
         log 'bin/conpty.dll is not the Microsoft original; leaving it untouched.'
@@ -1388,18 +1396,22 @@ install_terminal_conpty_shim() {
 
 install_terminal_mux_proxy() {
     # psmux resolves plain `powershell` from system32; put the proxy on that
-    # path too, replacing only Wine's builtin placeholder (kept as the
-    # .uurb-wine copy) or an earlier identical proxy.
+    # path too. Replace Wine's builtin placeholder (kept as the .uurb-wine
+    # copy), an earlier copy of this proxy (identified by its unique error
+    # marker, so upgrades apply), or install fresh.
     /usr/bin/install -d -m 0755 "$mux_powershell_dir" || return 1
     if /usr/bin/cmp -s "$mux_proxy_exe" "$terminal_proxy_compat"; then
         return 0
     fi
-    if [[ -f "$mux_proxy_exe" ]] && ! /usr/bin/head -c 128 "$mux_proxy_exe" |
-            /usr/bin/grep -aq 'Wine builtin DLL'; then
+    if [[ -f "$mux_proxy_exe" ]] && ! /usr/bin/grep -aq 'UU Ubuntu terminal bridge' \
+            "$mux_proxy_exe" && \
+            ! /usr/bin/head -c 128 "$mux_proxy_exe" |
+                /usr/bin/grep -aq 'Wine builtin DLL'; then
         log 'The WindowsPowerShell path holds a non-Wine powershell; psmux terminals stay unsupported.'
         return 1
     fi
-    if [[ -f "$mux_proxy_exe" ]]; then
+    if [[ -f "$mux_proxy_exe" ]] && /usr/bin/head -c 128 "$mux_proxy_exe" |
+            /usr/bin/grep -aq 'Wine builtin DLL'; then
         /bin/cp -p "$mux_proxy_exe" "${mux_proxy_placeholder}.tmp" &&
             chmod 600 "${mux_proxy_placeholder}.tmp" &&
             mv -f -- "${mux_proxy_placeholder}.tmp" "$mux_proxy_placeholder"

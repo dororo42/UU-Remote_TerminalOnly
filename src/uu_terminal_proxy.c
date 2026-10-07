@@ -995,6 +995,17 @@ int main(int argc, char **argv)
             write_error("UU Ubuntu terminal bridge refused an unsupported PowerShell command");
             return 1;
         }
+        /* A controller's launch script can finish while the terminal session
+         * is still open (the visible-attach helper rejection makes UU skip
+         * its idle attach on some clients). Hold the anchor until the owning
+         * conpty session ends, so the session, the PTY and the shell outlive
+         * the script instead of being torn down under the controller. */
+        if (exit_code == 0) {
+            trace_event("script_done_holding_session");
+            wait_direct_session(NULL);
+            trace_event("session_ended_releasing_anchor");
+            return 0;
+        }
         return exit_code;
     }
     /* Any other PowerShell command (UU also tries one to start its
