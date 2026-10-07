@@ -33,9 +33,26 @@ static int proxy_mux_attach_present;
 static int proxy_mux_config_present;
 static char proxy_mux_session[192];
 static char proxy_mux_config[320];
-/* Phase-only diagnostics beside this reviewed proxy.  No command,
- * token, port, handle or terminal byte is written. Each line is a single
- * append, with an identity and timestamp so concurrent retries are separable. */
+/* Phase-only diagnostics beside this reviewed proxy.  No token, port,
+ * handle or terminal byte is written. Each line is a single append, with an
+ * identity and timestamp so concurrent retries are separable. The one
+ * exception is the mux launch script, whose only contents are uuyc-mux and
+ * chcp commands — logged verbatim when diagnosing controller differences. */
+static void trace_event(const char *event);
+static void trace_text(const char *event, const wchar_t *wide)
+{
+    char narrow[384];
+    char line[512];
+    size_t index = 0;
+
+    while (wide[index] != L'\0' && index + 1 < sizeof(narrow)) {
+        narrow[index] = wide[index] <= L'~' ? (char)wide[index] : '?';
+        index++;
+    }
+    narrow[index] = '\0';
+    snprintf(line, sizeof(line), "%s %s", event, narrow);
+    trace_event(line);
+}
 static void trace_event(const char *event)
 {
     char path[MAX_PATH], *slash;
@@ -864,7 +881,7 @@ static int run_mux_script(const wchar_t *script, size_t length)
     int count;
     char line[64];
 
-    trace_event("mux_script_start");
+    trace_text("mux_script", script);
     /* psmux otherwise pre-spawns a spare pane and later hands it to a new
      * session under the spare's name, which would break anchor_session. */
     SetEnvironmentVariableW(L"PSMUX_NO_WARM", L"1");

@@ -639,10 +639,14 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             if (connection >= 0) {
                 if (peer_is_same_user(connection))
                     received = receive_client(connection, &message);
+                else
+                    fprintf(stderr, "terminal connection rejected: peer check\n");
                 close(connection);
             }
-            if (received < 0)
+            if (received < 0) {
+                fprintf(stderr, "terminal handshake rejected on a connection\n");
                 continue;
+            }
             if (message.role == UURB_TERMINAL_ROLE_ATTACH) {
                 /* The newest viewer replaces an older one. */
                 close_fd(&attach);
