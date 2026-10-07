@@ -44,14 +44,20 @@ static void trace_text(const char *event, const wchar_t *wide)
     char narrow[384];
     char line[512];
     size_t index = 0;
+    int part = 0;
 
-    while (wide[index] != L'\0' && index + 1 < sizeof(narrow)) {
-        narrow[index] = wide[index] <= L'~' ? (char)wide[index] : '?';
-        index++;
+    while (wide[index] != L'\0') {
+        size_t used = 0;
+        while (wide[index] != L'\0' && used + 1 < sizeof(narrow)) {
+            narrow[used] = wide[index] <= L'~' ? (char)wide[index] : '?';
+            used++;
+            index++;
+        }
+        narrow[used] = '\0';
+        snprintf(line, sizeof(line), "%s[%d] %s", event, part, narrow);
+        trace_event(line);
+        part++;
     }
-    narrow[index] = '\0';
-    snprintf(line, sizeof(line), "%s %s", event, narrow);
-    trace_event(line);
 }
 static void trace_event(const char *event)
 {
