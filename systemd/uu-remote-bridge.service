@@ -1,0 +1,26 @@
+[Unit]
+Description=UU Remote bridge for the live GNOME desktop
+After=default.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/uu-remote-bridge/environment
+ExecStart=%h/.local/bin/uu-remote-bridge
+# A clean child/signal exit is still an outage; systemctl stop remains final.
+Restart=always
+RestartSec=30
+TimeoutStopSec=15
+KillMode=control-group
+LimitNOFILE=65536
+# Small-host baseline. The installer adds a managed 6G/8G budget on hosts with
+# at least 16 GiB RAM: 4K relay plus outgoing WebView can exceed the 3G baseline.
+# Both budgets retain a finite hard limit and restart protection against leaks.
+MemoryHigh=3G
+MemoryMax=4G
+MemorySwapMax=2G
+TasksMax=1024
+OOMPolicy=stop
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_prefix="$HOME/.local/share/wineprefixes/uu-remote"
+wine_prefix="$default_prefix"
+wine_bin="${WINE_BIN:-/opt/wine-stable/bin/wine}"
+wineserver_bin="${WINESERVER_BIN:-/opt/wine-stable/bin/wineserver}"
+manage_service=false
+systemctl_user=(
+    /usr/bin/env
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+    /usr/bin/systemctl --user
+)
+
+usage() {
+    printf 'usage: clean-wine-device-registry [--manage-service] [WINEPREFIX]\n'
+}
+
+while (($#)); do
+    case "$1" in
+        --manage-service)
+            manage_service=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            usage >&2
+            exit 2
+            ;;
+        *)
+            wine_prefix="$1"
+            shift
+            if (($#)); then
+                usage >&2
+                exit 2
+            fi
+            ;;
+    esac
+done
+
+inspector="$script_dir/inspect-wine-device-registry.py"
+if [[ ! -x "$inspector" ]]; then
+    inspector="$HOME/.local/libexec/uu-inspect-wine-device-registry.py"
+fi
+stop_prefix="$script_dir/stop-wine-prefix"
+if [[ ! -x "$stop_prefix" ]]; then
+    stop_prefix="$HOME/.local/libexec/uu-remote-stop-wine-prefix"
+fi
+
+for required in "$inspector" "$stop_prefix" "$wine_bin"; do
+    if [[ ! -x "$required" ]]; then
+        printf 'required executable is unavailable: %s\n' "$required" >&2
+        exit 1
+    fi
+done
+if [[ ! -f "$wine_prefix/system.reg" ]]; then
+    printf 'Wine system registry is unavailable: %s/system.reg\n' \
+        "$wine_prefix" >&2
+    exit 1
+fi
+
+service_was_active=false
+restore_registry=false
+backup=''
+on_exit() {
+    local status=$?
+    trap - EXIT
+
+    "$stop_prefix" "$wine_prefix" "$wineserver_bin" >/dev/null 2>&1 || true
+    if ((status != 0)) && [[ "$restore_registry" == true && -f "$backup" ]]; then
+        /bin/cp -a "$backup" "$wine_prefix/system.reg"
+        printf 'Restored Wine registry backup after cleanup failure: %s\n' \
+            "$backup" >&2
+    fi
+    if [[ "$service_was_active" == true ]]; then
+        "${systemctl_user[@]}" start uu-remote-bridge.service \
+            >/dev/null 2>&1 || true
+    fi
+    exit "$status"
+}
+trap on_exit EXIT
+
+if "${systemctl_user[@]}" is-active --quiet uu-remote-bridge.service; then
+    if [[ "$manage_service" == true ]]; then
+        service_was_active=true
+        "${systemctl_user[@]}" stop uu-remote-bridge.service
+    elif [[ "$wine_prefix" == "$default_prefix" ]]; then
+        printf 'Stop UU first or rerun with --manage-service.\n' >&2
+        exit 1
+    fi
+fi
+"$stop_prefix" "$wine_prefix" "$wineserver_bin"
+
+if "$inspector" verify "$wine_prefix" >/dev/null 2>&1; then
+    printf 'Wine device registry hygiene is already active.\n'
+    exit 0
+fi
+"$inspector" preflight "$wine_prefix"
+# plan prints a blank line when there is nothing to delete; drop it or the
+# empty key would make `wine reg delete ''` fail.
+mapfile -t delete_keys < <("$inspector" plan "$wine_prefix" | grep -v '^$')
+
+backup_dir="$wine_prefix/compat/registry-backups"
+install -d -m 0700 "$backup_dir"
+backup="$backup_dir/system.reg.before-device-hygiene-$(date +%Y%m%dT%H%M%S)-$$"
+/bin/cp -a --reflink=auto "$wine_prefix/system.reg" "$backup"
+chmod 0600 "$backup"
+restore_registry=true
+
+export WINEPREFIX="$wine_prefix"
+export WINEDEBUG=-all
+export WINEDLLOVERRIDES='winebth.sys=d;winedbg.exe=d;mscoree,mshtml='
+"$wine_bin" reg add \
+    'HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\winebth' \
+    /v Start /t REG_DWORD /d 4 /f >/dev/null
+
+total="${#delete_keys[@]}"
+current=0
+for key in "${delete_keys[@]}"; do
+    current=$((current + 1))
+    "$wine_bin" reg delete "$key" /f >/dev/null
+    if ((total >= 100 && current % 100 == 0)); then
+        printf 'Removed %s/%s audited stale device keys.\n' "$current" "$total"
+    fi
+done
+
+"$stop_prefix" "$wine_prefix" "$wineserver_bin"
+"$inspector" verify "$wine_prefix"
+restore_registry=false
+printf 'Wine device registry cleanup complete; backup retained at %s\n' \
+    "$backup"

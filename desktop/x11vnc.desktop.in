@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=X11VNC Configuration
+Name[zh_CN]=X11VNC 配置工具
+Comment=Inspect X11VNC settings or open a remote desktop viewer
+Exec=/usr/bin/python3 "%HOME%/.local/libexec/uu-desktop-tool.py" x11vnc
+Icon=computer
+Terminal=false
+NoDisplay=true
+Hidden=true
+Categories=Network;RemoteAccess;

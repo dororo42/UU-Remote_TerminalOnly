@@ -1,0 +1,74 @@
+name: validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-docs:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0 (Node 24)
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          while IFS= read -r file; do
+            bash -n "$file" || exit
+          done < <(
+            find . -type f \( \
+              -name '*.sh' \
+              -o -path './scripts/uu-remote' \
+              -o -path './scripts/uu-remote-bridge' \
+              -o -path './scripts/uu-remote-console' \
+              -o -path './scripts/stop-wine-prefix' \
+              -o -path './scripts/runtime-source-digest' \
+            \) -not -path './build/*' -print
+          )
+
+      - name: Compile Python
+        run: python3 -m compileall -q scripts tests
+
+      - name: Install test compilers and isolated clipboard runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64-win32 \
+            wine wine64 wine64-tools \
+            openbox python3-gi python3-xlib tigervnc-viewer x11vnc \
+            x11-utils x11-xserver-utils xclip xcompmgr xdotool xvfb
+
+      - name: Run unit and documentation tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+
+      - name: Exercise the one-way controller clipboard boundary
+        shell: bash
+        env:
+          UURB_WINE_BIN: /usr/bin/wine
+          UURB_WINEBOOT_BIN: /usr/bin/wineboot
+          WINEGCC: /usr/bin/winegcc
+        run: |
+          wineserver_bin="$(dpkg-query -L wine64 | grep -E '/wineserver(64)?$')"
+          test -x "$wineserver_bin"
+          UURB_WINESERVER_BIN="$wineserver_bin" ./scripts/test-controller-clipboard.sh
+
+      - name: Validate approved manifests
+        run: python3 scripts/patch-gameviewer.py manifests

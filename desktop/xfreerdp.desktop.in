@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=FreeRDP Remote Desktop
+Name[zh_CN]=FreeRDP 远程桌面
+Comment=Choose a server and connect with FreeRDP
+Exec=/usr/bin/python3 "%HOME%/.local/libexec/uu-desktop-tool.py" rdp
+Icon=FreeRDP
+Terminal=false
+NoDisplay=true
+Hidden=true
+Categories=Network;RemoteAccess;
+StartupWMClass=xfreerdp

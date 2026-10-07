@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck — all shell scripts (error severity)
+        run: find . -name '*.sh' -type f -print0 | xargs -0 shellcheck --severity=error
+
+      - name: shellcheck — terminal-only kit (warning severity)
+        run: shellcheck --severity=warning uu-remote-ubuntu-plus/terminal-only/*.sh
+
+      - name: bash syntax check
+        run: find . -name '*.sh' -type f -print0 | xargs -0 -n1 bash -n
+
+      - name: python compile
+        run: python3 -m compileall -q uu-remote-ubuntu-plus/scripts uu-remote-ubuntu-plus/tests
+
+      - name: patch manifests are valid JSON
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          failures = []
+          manifests = sorted(pathlib.Path("uu-remote-ubuntu-plus/patches").glob("*.json"))
+          for path in manifests:
+              try:
+                  json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, ValueError) as error:
+                  failures.append(f"{path}: {error}")
+          if failures:
+              sys.exit("\n".join(failures))
+          print(f"validated {len(manifests)} patch manifests")
+          PY
+
+  unit-tests:
+    name: Unit tests (headless subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # test_runtime_scripts compiles the terminal bridge C sources
+      # (gcc + x86_64-w64-mingw32-gcc, -Werror), so this job doubles as a
+      # build gate for src/uu_terminal_bridge.c and the Wine-side proxy.
+      # python3-gi backs tests that import gi.repository (Gio).
+      - name: Install mingw cross compiler and python3-gi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 python3-gi
+
+      # Modules excluded here:
+      #   test_console_focus, test_display_modes, test_manager_capture,
+      #   test_x11_child_reaping, test_x11_live_geometry
+      #     — require Xvfb / Wine / GNOME sessions; run on a real deployment
+      #       host instead
+      #   test_update_manager
+      #     — uu_update_manager refuses to run outside a git repository, and
+      #       upstream lives flattened in a subdirectory without its own .git
+      - name: Run environment-independent unittest modules
+        working-directory: uu-remote-ubuntu-plus/tests
+        run: |
+          EXCLUDED="test_console_focus test_display_modes test_manager_capture test_x11_child_reaping test_x11_live_geometry test_update_manager"
+          MODULES=""
+          for f in test_*.py; do
+            m="${f%.py}"
+            case " $EXCLUDED " in
+              *" $m "*) ;;
+              *) MODULES="$MODULES $m" ;;
+            esac
+          done
+          python3 -m unittest -v $MODULES

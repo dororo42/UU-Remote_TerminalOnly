@@ -1,0 +1,15 @@
+/build/
+*.dll
+*.dmp
+*.exe
+*.log
+*.so
+__pycache__/
+.pytest_cache/
+node_modules/
+/.omc/*
+!/.omc/skills/
+/docs/handoff-codex.md
+
+# local-only implementation kit (handoff, plan) — never distributed
+/implementation-kit/

@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+service_name="${UURB_SERVICE_NAME:-uu-remote-bridge.service}"
+wine_bin="${UURB_WINE_BIN:-/opt/wine-stable/bin/wine}"
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-bridge"
+default_prefix="$HOME/.local/share/wineprefixes/uu-remote"
+systemctl_user=(
+    /usr/bin/env
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+    /usr/bin/systemctl --user
+)
+
+usage() {
+    cat <<'EOF'
+usage: uu-agent COMMAND [ARGUMENTS...]
+
+Commands:
+  version                         show the bundled UU controller CLI version
+  list                            list account devices
+  status                          show active controller connections
+  connect TARGET [CODE]           ask UU to open a device connection
+  disconnect TARGET               disconnect a controlled device
+  term TARGET [OPTIONS...]        open the UU remote terminal agent
+  cli ARGUMENTS...                pass arguments directly to uuyc-cli.exe
+  windows                         list visible windows on the private display
+  focus PATTERN                   focus the newest matching visible window
+  snapshot [PATH]                 capture the private controller display
+  runtime                         print non-secret bridge runtime paths
+
+Device lists and controller captures can contain private identifiers or screen
+content. Do not commit their output to a public repository.
+EOF
+}
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 2
+}
+
+process_environment_value() {
+    local name="$1"
+    local pid="$2"
+
+    /usr/bin/tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+        | /usr/bin/sed -n "s/^${name}=//p" \
+        | /usr/bin/head -n 1
+}
+
+discover_runtime() {
+    local cgroup
+    local cgroup_file
+    local cmdline
+    local pid
+    local server_pid=""
+
+    "${systemctl_user[@]}" is-active --quiet "$service_name" \
+        || fail "$service_name is not active"
+    cgroup="$(
+        "${systemctl_user[@]}" show "$service_name" \
+            --property=ControlGroup --value
+    )"
+    [[ "$cgroup" == /* ]] || fail "could not discover the bridge cgroup"
+    cgroup_file="/sys/fs/cgroup${cgroup}/cgroup.procs"
+    [[ -r "$cgroup_file" ]] || fail "cannot read bridge process membership"
+
+    while read -r pid; do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        cmdline="$(/usr/bin/tr '\0' ' ' <"/proc/$pid/cmdline")"
+        if [[ "$cmdline" == *GameViewerServer.exe* ]]; then
+            server_pid="$pid"
+            break
+        fi
+    done <"$cgroup_file"
+    [[ -n "$server_pid" ]] || fail "UU GameViewerServer.exe is not running"
+
+    bridge_display="$(
+        process_environment_value DISPLAY "$server_pid"
+    )"
+    wine_prefix="$(
+        process_environment_value WINEPREFIX "$server_pid"
+    )"
+    xauthority="$(
+        process_environment_value XAUTHORITY "$server_pid"
+    )"
+    wine_prefix="${wine_prefix:-$default_prefix}"
+    xauthority="${xauthority:-$runtime_dir/Xauthority}"
+
+    [[ "$bridge_display" == :* ]] || fail "invalid private display discovery"
+    [[ "$wine_prefix" == /* ]] || fail "invalid Wine prefix discovery"
+    [[ -r "$xauthority" ]] || fail "private X authority is unavailable"
+    [[ -x "$wine_bin" ]] || fail "Wine is unavailable at $wine_bin"
+
+    cli_exe="$wine_prefix/drive_c/Program Files/Netease/GameViewer/bin/uuyc-cli.exe"
+    [[ -f "$cli_exe" ]] || fail "uuyc-cli.exe is not installed"
+}
+
+run_cli() {
+    env \
+        DISPLAY="$bridge_display" \
+        XAUTHORITY="$xauthority" \
+        WINEPREFIX="$wine_prefix" \
+        WINEDEBUG=-all \
+        WINEDLLOVERRIDES='winedbg.exe=d;mscoree,mshtml=' \
+        "$wine_bin" "$cli_exe" "$@"
+}
+
+list_windows() {
+    local id
+    local name
+
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        name="$(
+            env DISPLAY="$bridge_display" XAUTHORITY="$xauthority" \
+                /usr/bin/xdotool getwindowname "$id" 2>/dev/null || true
+        )"
+        [[ -n "$name" ]] && printf '%s\t%s\n' "$id" "$name"
+    done < <(
+        env DISPLAY="$bridge_display" XAUTHORITY="$xauthority" \
+            /usr/bin/xdotool search --onlyvisible --name '.*' 2>/dev/null \
+            || true
+    )
+}
+
+focus_window() {
+    local pattern="$1"
+    local window_id
+
+    window_id="$(
+        env DISPLAY="$bridge_display" XAUTHORITY="$xauthority" \
+            /usr/bin/xdotool search --onlyvisible --name "$pattern" \
+            2>/dev/null | /usr/bin/tail -n 1 || true
+    )"
+    [[ -n "$window_id" ]] || fail "no visible window matched: $pattern"
+    env DISPLAY="$bridge_display" XAUTHORITY="$xauthority" \
+        /usr/bin/xdotool windowactivate --sync "$window_id"
+    printf '%s\n' "$window_id"
+}
+
+take_snapshot() {
+    local output="${1:-}"
+    local output_dir
+
+    if [[ -z "$output" ]]; then
+        output_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-agent/captures"
+        /usr/bin/install -d -m 0700 "$output_dir"
+        output="$output_dir/$(/usr/bin/date +%Y%m%dT%H%M%S).png"
+    fi
+    [[ "$output" == /* ]] || fail "snapshot path must be absolute"
+    /usr/bin/install -d -m 0700 "$(/usr/bin/dirname "$output")"
+    env DISPLAY="$bridge_display" XAUTHORITY="$xauthority" \
+        /usr/bin/scrot "$output"
+    /usr/bin/chmod 0600 "$output"
+    printf '%s\n' "$output"
+}
+
+(( $# > 0 )) || {
+    usage
+    exit 0
+}
+
+command_name="$1"
+shift
+discover_runtime
+
+case "$command_name" in
+    version)
+        (( $# == 0 )) || fail "version takes no arguments"
+        run_cli version
+        ;;
+    list)
+        (( $# == 0 )) || fail "list takes no arguments"
+        run_cli device list
+        ;;
+    status)
+        (( $# == 0 )) || fail "status takes no arguments"
+        run_cli device status
+        ;;
+    connect)
+        (( $# >= 1 && $# <= 2 )) || fail "connect requires TARGET [CODE]"
+        run_cli device connect "$@"
+        ;;
+    disconnect)
+        (( $# == 1 )) || fail "disconnect requires TARGET"
+        run_cli device disconnect "$1"
+        ;;
+    term)
+        (( $# >= 1 )) || fail "term requires TARGET [OPTIONS...]"
+        run_cli term "$@"
+        ;;
+    cli)
+        (( $# >= 1 )) || fail "cli requires uuyc-cli.exe arguments"
+        run_cli "$@"
+        ;;
+    windows)
+        (( $# == 0 )) || fail "windows takes no arguments"
+        list_windows
+        ;;
+    focus)
+        (( $# == 1 )) || fail "focus requires one window-name pattern"
+        focus_window "$1"
+        ;;
+    snapshot)
+        (( $# <= 1 )) || fail "snapshot accepts at most one path"
+        take_snapshot "${1:-}"
+        ;;
+    runtime)
+        (( $# == 0 )) || fail "runtime takes no arguments"
+        printf 'display=%s\nxauthority=%s\nwine_prefix=%s\n' \
+            "$bridge_display" "$xauthority" "$wine_prefix"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        fail "unknown command: $command_name"
+        ;;
+esac

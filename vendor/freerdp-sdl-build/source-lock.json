@@ -1,0 +1,163 @@
+{
+  "status": "CLIPBOARD_OWNER_GATED_SEQUENCE_AND_REMOTE_CACHE_ACTUAL_INCREMENTAL_BUILD_PASS_PENDING_INDEPENDENT_REVIEW",
+  "git_sources": {
+    "FreeRDP": {
+      "commit": "a8f1b46b0486b79e986d69530685af144268a9d0",
+      "url": "https://github.com/FreeRDP/FreeRDP.git",
+      "tracked_source_patch_set": [
+        "client/SDL/SDL3/sdl_context.cpp",
+        "client/SDL/SDL3/sdl_clip.cpp"
+      ]
+    },
+    "OpenH264": {
+      "commit": "652bdb7719f30b52b08e506645a7322ff1b2cc6f",
+      "url": "https://github.com/cisco/openh264.git",
+      "tracked_source_patch_set": []
+    },
+    "SDL_ttf": {
+      "commit": "a1ce3670aec736ecbf0936c43f2f0cc53aa61e5b",
+      "url": "https://github.com/libsdl-org/SDL_ttf.git",
+      "tracked_source_patch_set": []
+    },
+    "FreeType": {
+      "commit": "9973564cfa63763a3e4ac67c09147899539b1e07",
+      "url": "https://github.com/libsdl-org/freetype.git",
+      "tracked_source_patch_set": []
+    },
+    "HarfBuzz": {
+      "commit": "564bf9818a18709776856533829c0c04950773d6",
+      "url": "https://github.com/libsdl-org/harfbuzz.git",
+      "tracked_source_patch_set": []
+    }
+  },
+  "SDL3_source_archive": {
+    "name": "SDL3-3.2.28.tar.gz",
+    "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.2.28/SDL3-3.2.28.tar.gz",
+    "sha256": "1330671214d146f8aeb1ed399fc3e081873cdb38b5189d1f8bb6ab15bbc04211",
+    "metadata_url": "https://api.github.com/repos/libsdl-org/SDL/releases/tags/release-3.2.28",
+    "size": 15904256,
+    "tracked_source_patch_set": [
+      "src/video/windows/SDL_windowsevents.c",
+      "src/video/windows/SDL_windowsclipboard.c"
+    ]
+  },
+  "runtime_packages": [
+    {
+      "file": "openssl.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-openssl-3.6.5-1-any.pkg.tar.zst",
+      "sha256": "389d1af21e99223d9e2cd32d4c073131b276da85be7636bd8d23571f6938864f"
+    },
+    {
+      "file": "cjson.pkg.tar.zst",
+      "url": "https://mirror.msys2.org/mingw/mingw64/mingw-w64-x86_64-cjson-1.7.19-1-any.pkg.tar.zst",
+      "sha256": "f20c3fa89ab072caba93baca374f40b8c9ce23d6383aa55552ff13f31c7879aa"
+    },
+    {
+      "file": "uriparser.pkg.tar.zst",
+      "url": "https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-uriparser-1.0.2-1-any.pkg.tar.zst",
+      "sha256": "c7c1db089f04aa3c616fb53cddfa250b4e4dbb864b7d4d5250ade83e8a1e8d19"
+    }
+  ],
+  "owner_patch": {
+    "path": "freerdp-sdl-owner-refresh.patch",
+    "sha256": "ec6f4c5c979a56bf50dad919b37002481e81805c63dfb5db406d3435ef6a6944",
+    "description": "Pinned upstream FreeRDP owner refresh and DISPLAY_MOVED, FreeRDP clipboard callback, SDL clipboard owner/sequence event pumping with SDL window-internal lifecycle gate and desktop-fullscreen monitor bounds refresh in existing event pump; record post-CloseClipboard sequence snapshot only while non-null own HWND remains owner, and empty prior remote clipboard cache inside existing ReceiveServerFormatList locks",
+    "files": {
+      "FreeRDP/client/SDL/SDL3/sdl_context.cpp": {
+        "upstream_sha256": "cee9fef52d52f9eaccebd98aecf9971889c51429cec07111d616f7a6b0e2b841",
+        "patched_sha256": "9cb25ebae2b7660d6f7ab611701c3689b84a19a5fe9c8031d1b85c3c591c00ff"
+      },
+      "FreeRDP/client/SDL/SDL3/sdl_clip.cpp": {
+        "upstream_sha256": "177ab88d75b884204163c0424baa260c90e70c941c7b1e607b74340fd258aecf",
+        "patched_sha256": "ef9ce91d4ddab54a71aaf7c0a3bc0566de3c76c95c94be4b96734d7a6a85af5b"
+      },
+      "static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsevents.c": {
+        "upstream_sha256": "cb6921c86eeb2a133aca5991d075dcddc8ed3bc12ceed8ca0bb3cc368e218fb3",
+        "patched_sha256": "c6eea3e12c1d59e7aafcd1f4985a435a6683ad415c19f7a2b9cf8e1fab60bcd9"
+      },
+      "static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsclipboard.c": {
+        "upstream_sha256": "16291fe1f0fd5afe447b2e94245aef99d54bc3bd3d6bd3625434315b841ac953",
+        "patched_sha256": "a0af2689cf023a3caecaecd35a4f71aae975d6fc7bcc3cf0f259e9af212702d9"
+      }
+    }
+  },
+  "toolchain_reference": {
+    "gcc": "x86_64-w64-mingw32-gcc-posix (GCC) 13-posix",
+    "g++": "x86_64-w64-mingw32-g++-posix (GCC) 13-posix",
+    "binutils": "GNU ld (GNU Binutils) 2.45.90.20260125",
+    "cmake": "cmake version 4.2.3",
+    "ninja": "1.13.2",
+    "meson": "1.10.1",
+    "nasm": "NASM version 3.01",
+    "wine": "wine-11.0"
+  },
+  "build_options": {
+    "SDL3_archive_sha256": "1330671214d146f8aeb1ed399fc3e081873cdb38b5189d1f8bb6ab15bbc04211",
+    "SDL3_release_commit": "7f3ae3d57459e59943a4ecfefc8f6277ec6bf540",
+    "SDL_ttf_commit": "a1ce3670aec736ecbf0936c43f2f0cc53aa61e5b",
+    "freetype_commit": "9973564cfa63763a3e4ac67c09147899539b1e07",
+    "harfbuzz_commit": "564bf9818a18709776856533829c0c04950773d6",
+    "plutosvg": false,
+    "harfbuzz": true,
+    "freetype": true,
+    "shared_SDL": false
+  },
+  "cold_same_recipe_build": "Baseline cold product build completed and independently reviewed; current merged recipe is an incremental candidate and has not been cold rebuilt.",
+  "compiler_build_tools": {
+    "/usr/bin/x86_64-w64-mingw32-gcc-posix": "fccf18fc711b8b20ce898d5e420a6d08c17b7ab775107fa0883160ad1cfc8b88",
+    "/usr/bin/x86_64-w64-mingw32-g++-posix": "43befe0a8b6f3b40f54b5fac3717b4bf1cf56a2373b7b9bbbe21956211c16046",
+    "/usr/bin/x86_64-w64-mingw32-gcc-ar-posix": "637939937a25e0c2eaa4bc1d46b9307ff07bcf90744eaf45661528e7ac88486f",
+    "/usr/bin/x86_64-w64-mingw32-gcc-ranlib-posix": "c4d4d7b8400a70f9c93e4c9254583c99147ce3999ba4ca957bcaaa7b0382bca4",
+    "/usr/bin/x86_64-w64-mingw32-windres": "b67b294511306db4434be3d7ae45a997f6a9a6bd642ee0ddc4b91ba119ce4b40",
+    "/usr/bin/x86_64-w64-mingw32-ar": "da1993c90977644d72c9ef9598b05b21aac799f39be5d293a4248093b84a184a",
+    "/usr/bin/x86_64-w64-mingw32-strip": "8ae6a71ec67a95ea76a9dfbda7f813f13d5a1a6e889b082f9962f397b1038b39",
+    "/usr/bin/x86_64-w64-mingw32-objdump": "b537e83d5cffce66f923871e06f6e8a15d31ab531563109bc94c00498a4c01e9",
+    "/usr/bin/cmake": "6e1dccda39845415d68eabb934c598998949c99ec4668625d571aee1827b05c7",
+    "/usr/bin/ninja": "91e9548850cda2799facfdaa7abe33f9e978832f85e98212255708a7bbe437f2",
+    "/usr/bin/meson": "351bf432ee263564bddd23b503aa09a6e38a11e163f31f4bcec7e451b59a9be2",
+    "/usr/bin/nasm": "57b8fc5957237b0d9b1ff48c8f5823780fb8ce968d9b8434850c06941ad5d5f5",
+    "/usr/bin/patch": "44ecd416d1958be9c2b60488fa893e76aae8d0f81d2fedb9e83eb661da0ee18c",
+    "/usr/bin/x86_64-w64-mingw32-gcc-win32": "260b0d734871a82030aaaa446338cd1dd1a48efeec119a110c0379b73a7ce972"
+  },
+  "compat_shim": {
+    "source": "src/winpr_sspi_shim.c",
+    "source_sha256": "04ad4779ab7e5ef2663412af323f48130fffe79dea1b3f1dc1ab169659d813a5",
+    "build_recipe": "scripts/build-compat.sh",
+    "build_recipe_sha256": "146edc15b0c54434944c6ce9274b4a413be5195b23532471e480675b52d1e427",
+    "compiler": "/usr/bin/x86_64-w64-mingw32-gcc",
+    "flags": [
+      "-std=c11",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-Wl,--no-insert-timestamp",
+      "-shared"
+    ]
+  },
+  "source_cache_policy": "Fresh root and output only. Strict Git tracked/untracked rejection; vetted nested FreeType/HarfBuzz are exact tracked SDL_ttf gitlinks, not broad untracked exemptions.",
+  "build_evidence": {
+    "baseline": {
+      "kind": "cold",
+      "build": "product-5k-source-9dfc60f63f3c",
+      "sdl_exe_sha256": "e1f6d26bb39dcd3e08e1c59c25b98f3c9d6655c6abef848659a40ca27b246aff",
+      "recipe_lock_sha256": "673eaa2099274a18f8bb77958115ee33b7a056f642cafa8f88be7500a8b2acee",
+      "closure": "13PE installed and independently reviewed"
+    },
+    "current": {
+      "kind": "incremental from verified baseline cold source and existing build",
+      "status": "OWNER_GATED_CLIPBOARD_BOUNDARIES_ACTUAL_INCREMENTAL_BUILD_PASS_PENDING_INDEPENDENT_REVIEW",
+      "cold_rebuild": false,
+      "real_Mac_5K_and_clipboard_acceptance": "NOT_RUN_FOR_THIS_CANDIDATE",
+      "real_phone_Chinese_acceptance": "PENDING_AFTER_DEPLOYMENT",
+      "sdl_exe_sha256": "dbdaf1a3904456c09fa81f3860724d5d9ef11750fcbfa6f9312397919c18c534",
+      "thirteen_PE_count": 13,
+      "strict_owner_compile_and_relink": "PASS, empty diagnostics",
+      "strict_two_changed_full_translation_units": "PASS; exact frozen full TU Werror receipts",
+      "isolated_Wine_owner_interleave": "PASS: own noecho and all three actual external-write timings delivered exactly once",
+      "incremental_receipt_sha256": "08a036c7bfdefc405dad9a9f335d2ab7435b70f8ea309a4b8463b99f890482e2",
+      "previous_sdl_exe_sha256": "653703d92edb8e9bfbfadb4f7344b09d0310ca5750b0c2faed759290c7fe09d6",
+      "superseded_unconditional_sequence_sdl_exe_sha256": "78d2aa4907bb2eb07b997704e5f242ed118e78605e94287ce3aa88b596ed878f"
+    }
+  }
+}

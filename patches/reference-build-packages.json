@@ -1,0 +1,161 @@
+{
+  "distribution": "Ubuntu 26.04 (resolute)",
+  "architecture": "amd64",
+  "scope": "Reference compiler/build tools and their data, runtime and sysroot support; not a complete operating-system dependency closure.",
+  "source_lock": "vendor/freerdp-sdl-build/source-lock.json",
+  "packages": [
+    {
+      "package": "binutils-mingw-w64-base",
+      "version": "2.45.90.20260125-1ubuntu1+13.3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/b/binutils-mingw-w64/binutils-mingw-w64-base_2.45.90.20260125-1ubuntu1+13.3_amd64.deb",
+      "sha256": "f3dbbe4aec206d7078987c9ba3286df20a5fab4ed8c63b0f0d31969c26bdfcbf",
+      "bytes": 163218,
+      "filename": "binutils-mingw-w64-base_2.45.90.20260125-1ubuntu1+13.3_amd64.deb"
+    },
+    {
+      "package": "binutils-mingw-w64-x86-64",
+      "version": "2.45.90.20260125-1ubuntu1+13.3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/b/binutils-mingw-w64/binutils-mingw-w64-x86-64_2.45.90.20260125-1ubuntu1+13.3_amd64.deb",
+      "sha256": "f835050ed5b7fedf8f3242610fda1eb55b5472b72624f9a88de90c610b465552",
+      "bytes": 3097918,
+      "filename": "binutils-mingw-w64-x86-64_2.45.90.20260125-1ubuntu1+13.3_amd64.deb"
+    },
+    {
+      "package": "cmake",
+      "version": "4.2.3-2ubuntu2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/cmake/cmake_4.2.3-2ubuntu2_amd64.deb",
+      "sha256": "87c496f1e37b64bc0b4ad9c5fe0e75c09655f5399ed39695b876afba55becc61",
+      "bytes": 13742846,
+      "filename": "cmake_4.2.3-2ubuntu2_amd64.deb"
+    },
+    {
+      "package": "cmake-data",
+      "version": "4.2.3-2ubuntu2",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/cmake/cmake-data_4.2.3-2ubuntu2_all.deb",
+      "sha256": "9f4cc6f77e7c09929f80fc5534b638b95d257a90d6bf43c59d2232514759eb9d",
+      "bytes": 2581178,
+      "filename": "cmake-data_4.2.3-2ubuntu2_all.deb"
+    },
+    {
+      "package": "g++-mingw-w64-x86-64-posix",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/g++-mingw-w64-x86-64-posix_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "52c3613f386e462ae71105d1a0b2a48d866ccb048ad253acff629c5a2291252d",
+      "bytes": 14701014,
+      "filename": "g++-mingw-w64-x86-64-posix_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "gcc-mingw-w64-base",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/gcc-mingw-w64-base_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "a30c07e807e9874ea93909448c5d6d37f9569ebe60ad32de8e490aad198538a3",
+      "bytes": 188046,
+      "filename": "gcc-mingw-w64-base_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "gcc-mingw-w64-x86-64-posix",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/gcc-mingw-w64-x86-64-posix_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "0855fa1d4a618550faac3a3e4352aa3226833b28184ad3c3b496a68a22c4eda2",
+      "bytes": 35401298,
+      "filename": "gcc-mingw-w64-x86-64-posix_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "gcc-mingw-w64-x86-64-posix-runtime",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/gcc-mingw-w64-x86-64-posix-runtime_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "aca6b438e0b55b11cedcf1170a1ee26e7979e34192e34f6e6389e560908a5bfc",
+      "bytes": 14036962,
+      "filename": "gcc-mingw-w64-x86-64-posix-runtime_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "gcc-mingw-w64-x86-64-win32",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/gcc-mingw-w64-x86-64-win32_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "80e1430303e1a619fc9cfc66225893d81486e52801e1916b712d8111d100ae38",
+      "bytes": 35402818,
+      "filename": "gcc-mingw-w64-x86-64-win32_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "gcc-mingw-w64-x86-64-win32-runtime",
+      "version": "13.2.0-6ubuntu1+26.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-mingw-w64/gcc-mingw-w64-x86-64-win32-runtime_13.2.0-6ubuntu1+26.1_amd64.deb",
+      "sha256": "7ac09bc7f283f1148c8e1697373db069c1d4364a9f5fa58bb66c8a93760b8b65",
+      "bytes": 14185558,
+      "filename": "gcc-mingw-w64-x86-64-win32-runtime_13.2.0-6ubuntu1+26.1_amd64.deb"
+    },
+    {
+      "package": "meson",
+      "version": "1.10.1-1ubuntu2",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/m/meson/meson_1.10.1-1ubuntu2_all.deb",
+      "sha256": "854f70286df0fa259e9e6c2c18cdfeb41276dc3afa4356f2a2605439baf31d5f",
+      "bytes": 689776,
+      "filename": "meson_1.10.1-1ubuntu2_all.deb"
+    },
+    {
+      "package": "mingw-w64-common",
+      "version": "13.0.0-2ubuntu1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/m/mingw-w64/mingw-w64-common_13.0.0-2ubuntu1_all.deb",
+      "sha256": "da9b2cb14134ca0ef3a31302df50295a2dd6fee7aa4fd888b11c6f72f8ab939e",
+      "bytes": 6143818,
+      "filename": "mingw-w64-common_13.0.0-2ubuntu1_all.deb"
+    },
+    {
+      "package": "mingw-w64-x86-64-dev",
+      "version": "13.0.0-2ubuntu1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/m/mingw-w64/mingw-w64-x86-64-dev_13.0.0-2ubuntu1_all.deb",
+      "sha256": "da40b9e2ae89d98d44b547a9e4fd01862858edb176bade9f12ad143e7ae7efe4",
+      "bytes": 5292150,
+      "filename": "mingw-w64-x86-64-dev_13.0.0-2ubuntu1_all.deb"
+    },
+    {
+      "package": "nasm",
+      "version": "3.01-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nasm/nasm_3.01-1_amd64.deb",
+      "sha256": "a611d0d8f35d49e8c9f4b76ff6ef77fba2183ef1b46d0699431a848ba8d2cb46",
+      "bytes": 530088,
+      "filename": "nasm_3.01-1_amd64.deb"
+    },
+    {
+      "package": "ninja-build",
+      "version": "1.13.2-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/ninja-build/ninja-build_1.13.2-1_amd64.deb",
+      "sha256": "533239a464183f041f7c979f899fd8419e31ac82366540e57902a255de78f156",
+      "bytes": 171092,
+      "filename": "ninja-build_1.13.2-1_amd64.deb"
+    },
+    {
+      "package": "patch",
+      "version": "2.8-2build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/patch/patch_2.8-2build1_amd64.deb",
+      "sha256": "0e5a899095d92d6db9585183a5225504f5dc5ecaffdfe2a25d745a9502de3b30",
+      "bytes": 95680,
+      "filename": "patch_2.8-2build1_amd64.deb"
+    },
+    {
+      "package": "python3-setuptools",
+      "version": "78.1.1-0.1build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/s/setuptools/python3-setuptools_78.1.1-0.1build1_all.deb",
+      "sha256": "7dbe7963bacc589b5f3d48dbad14fb3815cf097b1173cde207c0d91268bc83cc",
+      "bytes": 661184,
+      "filename": "python3-setuptools_78.1.1-0.1build1_all.deb"
+    }
+  ]
+}

@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+environment_file="$HOME/.config/uu-remote-bridge/environment"
+saved_wine_prefix=""
+if [[ -f "$environment_file" ]]; then
+    saved_wine_prefix="$(/usr/bin/sed -n 's/^UURB_WINEPREFIX=//p' "$environment_file" | /usr/bin/tail -n 1)"
+fi
+export WINEPREFIX="${UURB_WINEPREFIX:-${WINEPREFIX:-${saved_wine_prefix:-$HOME/.local/share/wineprefixes/uu-remote}}}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+
+wine_bin="${WINE_BIN:-/opt/wine-stable/bin/wine}"
+wineserver_bin="${WINESERVER_BIN:-/opt/wine-stable/bin/wineserver}"
+wine_stop_bin="$HOME/.local/libexec/uu-remote-stop-wine-prefix"
+connection_status_bin="$HOME/.local/libexec/uu-connection-status"
+registry_cleaner_bin="$HOME/.local/libexec/uu-clean-wine-device-registry"
+console_bin="$HOME/.local/bin/uu-remote-console"
+app_dir="$WINEPREFIX/drive_c/Program Files/Netease/GameViewer"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote"
+systemctl_user=(
+    /usr/bin/env
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+    /usr/bin/systemctl --user
+)
+
+notify_error() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send 'UU Remote' "$1"
+    fi
+    printf '%s\n' "$1" >&2
+}
+
+mkdir -p "$state_dir"
+
+case "${1:-open}" in
+    status)
+        exec "${systemctl_user[@]}" status uu-remote-bridge.service --no-pager
+        ;;
+    restart)
+        exec "${systemctl_user[@]}" restart uu-remote-bridge.service
+        ;;
+    stop)
+        exec "${systemctl_user[@]}" stop uu-remote-bridge.service
+        ;;
+    logs)
+        exec journalctl --user -fu uu-remote-bridge.service
+        ;;
+    network)
+        exec /usr/bin/python3 "$connection_status_bin"
+        ;;
+    quality)
+        shift || true
+        quality_bin="$HOME/.local/libexec/uu-quality.py"
+        if [[ ! -f "$quality_bin" ]]; then
+            notify_error 'The UU quality helper is not installed.'
+            exit 1
+        fi
+        exec /usr/bin/python3 "$quality_bin" "$@"
+        ;;
+    repair-registry)
+        if [[ ! -x "$registry_cleaner_bin" ]]; then
+            notify_error 'The Wine device-registry repair helper is not installed.'
+            exit 1
+        fi
+        exec "$registry_cleaner_bin" --manage-service "$WINEPREFIX"
+        ;;
+    update)
+        shift || true
+        if [[ ! -x "$HOME/.local/bin/uu-remote-update" ]]; then
+            notify_error 'UU automatic maintenance is not enabled.'
+            exit 1
+        fi
+        if (($# == 0)); then
+            set -- status
+        fi
+        exec "$HOME/.local/bin/uu-remote-update" "$@"
+        ;;
+    upgrade)
+        shift || true
+        if [[ ! -x "$HOME/.local/bin/uu-remote-upgrade" ]]; then
+            notify_error 'The reusable UU upgrader is not installed.'
+            exit 1
+        fi
+        exec "$HOME/.local/bin/uu-remote-upgrade" "$@"
+        ;;
+    login)
+        shift || true
+        if [[ -z "${DISPLAY:-}" ]]; then
+            notify_error 'Run account login from a visible desktop terminal.'
+            exit 1
+        fi
+        if [[ ! -f "$app_dir/GameViewer.exe" ]]; then
+            notify_error 'UU Remote is not installed in the bridge Wine prefix.'
+            exit 1
+        fi
+        "${systemctl_user[@]}" stop uu-remote-bridge.service
+        "$wine_stop_bin" "$WINEPREFIX" "$wineserver_bin"
+        restart_bridge() {
+            "$wine_stop_bin" "$WINEPREFIX" "$wineserver_bin" || true
+            "${systemctl_user[@]}" start uu-remote-bridge.service
+        }
+        trap restart_bridge EXIT
+        cd "$app_dir"
+        "$wine_bin" GameViewer.exe "$@" >>"$state_dir/client.log" 2>&1
+        exit 0
+        ;;
+    open)
+        shift || true
+        if [[ -z "${DISPLAY:-}" ]]; then
+            notify_error 'Open UU Remote from a logged-in graphical desktop.'
+            exit 1
+        fi
+        if [[ ! -f "$app_dir/GameViewer.exe" ]]; then
+            notify_error 'UU Remote is not installed in the bridge Wine prefix.'
+            exit 1
+        fi
+        if [[ ! -x "$console_bin" ]]; then
+            notify_error 'The UU Remote window helper is not installed.'
+            exit 1
+        fi
+        exec "$console_bin" window "$@"
+        ;;
+    console)
+        shift || true
+        if [[ ! -x "$console_bin" ]]; then
+            notify_error 'The local UU Remote console is not installed.'
+            exit 1
+        fi
+        exec "$console_bin" open "$@"
+        ;;
+    *)
+        printf 'usage: uu-remote [open|console|login|status|network|quality|repair-registry|restart|stop|logs|update|upgrade]\n' >&2
+        exit 2
+        ;;
+esac

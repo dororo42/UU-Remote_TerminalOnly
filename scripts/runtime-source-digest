@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_dir"
+
+runtime_files=(
+    install.sh
+    uninstall.sh
+    patches/libei-1.2.1-close-keymap-fd.patch
+    scripts/build-compat.sh
+    scripts/verify-freerdp-input-sdk.py
+    scripts/uu-full-ready.py
+    scripts/uu-manual-plane.py
+    scripts/build-libei.sh
+    scripts/build-winpr.sh
+    scripts/verify-freerdp-runtime.py
+    patches/freerdp-sdl-product.json
+    vendor/freerdp-sdl-build/bootstrap.sh
+    vendor/freerdp-sdl-build/build-sdl.sh
+    vendor/freerdp-sdl-build/build-freerdp.sh
+    vendor/freerdp-sdl-build/strict-owner-unit.py
+    vendor/freerdp-sdl-build/toolchain.cmake
+    vendor/freerdp-sdl-build/lto-cap.cmake
+    vendor/freerdp-sdl-build/check-lto.py
+    vendor/freerdp-sdl-build/mingw.ini
+    vendor/freerdp-sdl-build/source-lock.json
+    vendor/freerdp-sdl-build/freerdp-sdl-owner-refresh.patch
+    scripts/clean-wine-device-registry
+    scripts/compare-pe-normalized.py
+    scripts/configure-unattended.sh
+    scripts/inspect-wine-device-registry.py
+    scripts/runtime-settings.sh
+    scripts/runtime-source-digest
+    scripts/stop-wine-prefix
+    scripts/uu_connection_status.py
+    scripts/uu-cursor-asset.py
+    scripts/uu-rdp-credentials.py
+    scripts/uu-quality.py
+    scripts/uu-controller-fit.py
+    scripts/uu-display-modes.py
+    scripts/uu-desktop-tool.py
+    scripts/uu-keyring-unlock.py
+    scripts/uu-agent
+    scripts/uu-ssh
+    scripts/uu-shell
+    scripts/uu-link
+    scripts/uu-remote
+    scripts/uu-remote-bridge
+    scripts/uu-shared-physical-vnc
+    scripts/uu-remote-console
+    scripts/upgrade-uu-remote.sh
+    scripts/verify.sh
+    src/uu_cursor_guard.c
+    src/uu_display_mode.c
+    src/uu_injector.c
+    src/uu_input_bridge.c
+    src/uu_input_bridge_legacy.c
+    src/uu_input_broker.c
+    src/uurb_ready.c
+    src/uurb_ready.h
+    src/uurb_rdp_backend.c
+    src/uurb_rdp_backend.h
+    src/uurb_rdp_state.h
+    src/uurb_public_config.h
+    src/uu-input-broker-probe.c
+    src/plugin.c
+    src/freerdp-adapter.c
+    src/freerdp-adapter.h
+    src/full-input.c
+    src/full-input.h
+    src/uu_wine_clipboard_bridge.c
+    src/uu_network_filter.c
+    src/uu_manager_capture.c
+    src/uu_service_control.c
+    src/uu_terminal_bridge.c
+    src/uu_terminal_proxy.c
+    src/uu_x11_input.c
+    src/uu_x11_clipboard.c
+    src/winlogon.c
+    src/winpr_sspi_shim.c
+    src/x11_input_protocol.h
+    src/x11_manager_capture_api.h
+    src/x11_clipboard_protocol.h
+    src/terminal_bridge_protocol.h
+    systemd/uu-keyring-unlock.service
+    systemd/uu-remote-bridge-unattended.conf
+    systemd/uu-remote-bridge.service
+    systemd/uu-shared-physical-vnc.service
+    systemd/uu-remote-console.service
+    desktop/uu-remote.desktop.in
+    desktop/uu-quality.desktop.in
+    desktop/uu-tools-fonts.conf
+    desktop/uu-vnc-viewer.desktop.in
+    desktop/xtigervncviewer.desktop.in
+    desktop/x11vnc.desktop.in
+    desktop/xfreerdp.desktop.in
+    desktop/obconf.desktop.in
+)
+runtime_files+=(vendor/freerdp-input-sdk/manifest.json vendor/freerdp-input-sdk/LICENSE vendor/freerdp-input-sdk/README.md)
+while IFS= read -r sdk_header; do
+    runtime_files+=("$sdk_header")
+done < <(find vendor/freerdp-input-sdk/include -type f -print | LC_ALL=C sort)
+release_manifests=(patches/uu-remote-*.json)
+
+sha256sum "${runtime_files[@]}" "${release_manifests[@]}" | \
+    sha256sum | awk '{print $1}'

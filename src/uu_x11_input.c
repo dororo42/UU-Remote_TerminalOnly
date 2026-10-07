@@ -1,0 +1,1932 @@
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "x11_input_protocol.h"
+
+#define UURB_SELECTION_QUIET_MS UINT64_C(50)
+#define UURB_SELECTION_READY_TIMEOUT_MS UINT64_C(500)
+#define UURB_SELECTION_REQUEST_TIMEOUT_MS UINT64_C(1500)
+#define UURB_SELECTION_POST_REQUEST_MS UINT64_C(50)
+#define UURB_RELAY_PASTE_KEY_DELAY_MS UINT64_C(20)
+#define UURB_VK_BACK UINT16_C(0x08)
+#define UURB_SELECTION_STATUS_CAPACITY 512U
+#define UURB_SELECTION_REAP_INTERVAL_MS 250
+#define UURB_SELECTION_TRANSACTION_TIMEOUT_MS UINT64_C(3000)
+
+/* Keep the helper buildable with runtime X11 libraries only. */
+typedef struct _XDisplay Display;
+typedef int Bool;
+typedef unsigned long Atom;
+typedef unsigned long KeySym;
+typedef unsigned long Window;
+typedef unsigned char KeyCode;
+typedef union x11_event {
+    long padding[24];
+    struct {
+        int type;
+        unsigned long serial;
+        Bool send_event;
+        Display *display;
+        Window window;
+        Atom message_type;
+        int format;
+        union { char b[20]; short s[10]; long l[5]; } data;
+    } client;
+} x11_event;
+typedef Display *(*x_open_display_fn)(const char *);
+typedef int (*x_close_display_fn)(Display *);
+typedef int (*x_sync_fn)(Display *, Bool);
+typedef Atom (*x_intern_atom_fn)(Display *, const char *, Bool);
+typedef Window (*x_get_selection_owner_fn)(Display *, Atom);
+typedef int (*x_default_screen_fn)(Display *);
+typedef Bool (*x_get_geometry_fn)(Display *, Window, Window *, int *, int *,
+                                unsigned int *, unsigned int *, unsigned int *, unsigned int *);
+typedef KeyCode (*x_keysym_to_keycode_fn)(Display *, KeySym);
+typedef Window (*x_default_root_window_fn)(Display *);
+typedef int (*x_get_window_property_fn)(Display *, Window, Atom, long, long,
+                                        Bool, Atom, Atom *, int *,
+                                        unsigned long *, unsigned long *,
+                                        unsigned char **);
+typedef int (*x_free_fn)(void *);
+typedef Bool (*x_send_event_fn)(Display *, Window, Bool, long, x11_event *);
+typedef Bool (*xtest_query_extension_fn)(Display *, int *, int *, int *, int *);
+typedef Bool (*xtest_fake_key_event_fn)(Display *, unsigned int, Bool,
+                                        unsigned long);
+typedef Bool (*xtest_fake_button_event_fn)(Display *, unsigned int, Bool,
+                                           unsigned long);
+typedef Bool (*xtest_fake_motion_event_fn)(Display *, int, int, int,
+                                           unsigned long);
+typedef Bool (*xtest_fake_relative_motion_event_fn)(Display *, int, int,
+                                                    unsigned long);
+
+typedef struct x11_api {
+    void *x11_library;
+    void *xtst_library;
+    x_open_display_fn open_display;
+    x_close_display_fn close_display;
+    x_sync_fn sync;
+    x_intern_atom_fn intern_atom;
+    x_get_selection_owner_fn get_selection_owner;
+    x_default_screen_fn default_screen;
+    x_get_geometry_fn get_geometry;
+    x_keysym_to_keycode_fn keysym_to_keycode;
+    x_default_root_window_fn default_root_window;
+    x_get_window_property_fn get_window_property;
+    x_free_fn free_data;
+    x_send_event_fn send_event;
+    xtest_query_extension_fn query_extension;
+    xtest_fake_key_event_fn fake_key_event;
+    xtest_fake_button_event_fn fake_button_event;
+    xtest_fake_motion_event_fn fake_motion_event;
+    xtest_fake_relative_motion_event_fn fake_relative_motion_event;
+} x11_api;
+
+typedef struct selection_status {
+    char buffer[UURB_SELECTION_STATUS_CAPACITY];
+    size_t length;
+    unsigned long next_request_number;
+    bool ownership_lost;
+    bool x_error;
+} selection_status;
+
+static volatile sig_atomic_t stop_requested;
+static volatile sig_atomic_t listener_fd = -1;
+static volatile sig_atomic_t active_client_fd = -1;
+static volatile sig_atomic_t clipboard_owner_pid = -1;
+static volatile sig_atomic_t primary_owner_pid = -1;
+static volatile sig_atomic_t clipboard_status_fd = -1;
+static volatile sig_atomic_t primary_status_fd = -1;
+static volatile sig_atomic_t action_child_pid = -1;
+static selection_status clipboard_status;
+static selection_status primary_status;
+static unsigned int selection_error_reports;
+static uint64_t selection_reap_deadline;
+/* Nonzero only while this single authenticated client owns an uncommitted
+ * owner-only paste. Normal protocol reads keep their existing idle semantics. */
+static uint64_t selection_transaction_deadline;
+
+typedef struct selection_transaction {
+    uint32_t sequence;
+    uint32_t last_sequence;
+    pid_t clipboard_pid;
+    pid_t primary_pid;
+    Window clipboard_window;
+    Window primary_window;
+    unsigned long clipboard_baseline;
+    unsigned long primary_baseline;
+    bool ended_cr;
+    bool pending;
+} selection_transaction;
+
+static bool selection_owner_alive(volatile sig_atomic_t *owner_pid);
+static uint64_t monotonic_milliseconds(void);
+
+static bool wait_input_ready(int fd)
+{
+    struct pollfd descriptor = { .fd = fd, .events = POLLIN };
+
+    while (!stop_requested) {
+        int result;
+        uint64_t now = monotonic_milliseconds();
+
+        /* Only reap retained selection children; synchronous action children
+         * must keep their own exit status. Timeouts preserve partial frames. */
+        if (now >= selection_reap_deadline) {
+            selection_owner_alive(&clipboard_owner_pid);
+            selection_owner_alive(&primary_owner_pid);
+            selection_reap_deadline = now + UURB_SELECTION_REAP_INTERVAL_MS;
+        }
+        if (selection_transaction_deadline != 0 &&
+            now >= selection_transaction_deadline)
+            return false;
+        uint64_t timeout = selection_reap_deadline - now;
+        if (selection_transaction_deadline != 0 &&
+            selection_transaction_deadline - now < timeout)
+            timeout = selection_transaction_deadline - now;
+        result = poll(&descriptor, 1, (int)timeout);
+        if (result > 0)
+            return !stop_requested && !(descriptor.revents & POLLNVAL);
+        if (result < 0 && errno != EINTR)
+            return false;
+    }
+    return false;
+}
+
+static void report_selection_error(const char *stage)
+{
+    /* Bounded, content-free diagnostics. Never dump selection data, window
+     * titles, keycodes or xclip's stderr (which may contain other app names). */
+    if (selection_error_reports++ < 64U) {
+        fprintf(stderr, "semantic-selection-failure stage=%s time-ms=%llu\n",
+                stage, (unsigned long long)time(NULL) * 1000ULL);
+        fflush(stderr);
+    }
+}
+
+static void handle_signal(int signal_number)
+{
+    int fd;
+
+    (void)signal_number;
+    stop_requested = 1;
+    fd = listener_fd;
+    listener_fd = -1;
+    if (fd >= 0)
+        close(fd);
+    fd = active_client_fd;
+    active_client_fd = -1;
+    if (fd >= 0)
+        close(fd);
+    fd = clipboard_owner_pid;
+    clipboard_owner_pid = -1;
+    if (fd > 0)
+        kill(fd, SIGTERM);
+    fd = primary_owner_pid;
+    primary_owner_pid = -1;
+    if (fd > 0)
+        kill(fd, SIGTERM);
+    fd = clipboard_status_fd;
+    clipboard_status_fd = -1;
+    if (fd >= 0)
+        close(fd);
+    fd = primary_status_fd;
+    primary_status_fd = -1;
+    if (fd >= 0)
+        close(fd);
+    fd = action_child_pid;
+    if (fd > 0)
+        kill(fd, SIGTERM);
+}
+
+static bool read_all(int fd, void *buffer, size_t size)
+{
+    unsigned char *position = buffer;
+
+    while (size > 0) {
+        ssize_t received;
+
+        if (!wait_input_ready(fd))
+            return false;
+        received = recv(fd, position, size, 0);
+
+        if (received == 0)
+            return false;
+        if (received < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        position += (size_t)received;
+        size -= (size_t)received;
+    }
+    return true;
+}
+
+static bool write_all(int fd, const void *buffer, size_t size)
+{
+    const unsigned char *position = buffer;
+
+    while (size > 0) {
+        ssize_t written = send(fd, position, size, MSG_NOSIGNAL);
+
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (written == 0)
+            return false;
+        position += (size_t)written;
+        size -= (size_t)written;
+    }
+    return true;
+}
+
+static uint64_t monotonic_milliseconds(void)
+{
+    struct timespec value;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0)
+        return 0;
+    return (uint64_t)value.tv_sec * UINT64_C(1000) +
+           (uint64_t)value.tv_nsec / UINT64_C(1000000);
+}
+
+static void sleep_milliseconds(uint64_t milliseconds)
+{
+    struct timespec delay;
+
+    delay.tv_sec = (time_t)(milliseconds / UINT64_C(1000));
+    delay.tv_nsec = (long)(milliseconds % UINT64_C(1000)) * 1000000L;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR)
+        ;
+}
+
+static bool root_property(const x11_api *api, Display *display, Atom property,
+                          Atom expected_type, unsigned long **values,
+                          unsigned long *count)
+{
+    Atom actual_type;
+    int format;
+    unsigned long remaining;
+    unsigned char *data = NULL;
+
+    *values = NULL;
+    *count = 0;
+    if (api->get_window_property(display, api->default_root_window(display),
+                                  property, 0, 4096, 0, expected_type,
+                                  &actual_type, &format, count, &remaining,
+                                  &data) != 0 ||
+        actual_type != expected_type || format != 32 || remaining != 0 ||
+        !data || *count == 0) {
+        if (data)
+            api->free_data(data);
+        return false;
+    }
+    *values = (unsigned long *)data;
+    return true;
+}
+
+static bool show_desktop_state(const x11_api *api, Display *display,
+                                Atom property, bool *showing)
+{
+    unsigned long *values;
+    unsigned long count;
+    bool valid;
+
+    if (!root_property(api, display, property, 6, &values, &count))
+        return false;
+    valid = count == 1 && values[0] <= 1;
+    if (valid)
+        *showing = values[0] != 0;
+    api->free_data(values);
+    return valid;
+}
+
+static bool toggle_show_desktop(const x11_api *api, Display *display)
+{
+    Atom property = api->intern_atom(display, "_NET_SHOWING_DESKTOP", 0);
+    Atom supported = api->intern_atom(display, "_NET_SUPPORTED", 0);
+    unsigned long *values;
+    unsigned long count;
+    unsigned long index;
+    bool advertised = false;
+    bool before;
+    uint64_t deadline;
+    x11_event event = {0};
+
+    if (!root_property(api, display, supported, 4, &values, &count))
+        return false;
+    for (index = 0; index < count; index++)
+        if (values[index] == property)
+            advertised = true;
+    api->free_data(values);
+    if (!advertised || !show_desktop_state(api, display, property, &before))
+        return false;
+    event.client.type = 33; /* ClientMessage */
+    event.client.display = display;
+    event.client.window = api->default_root_window(display);
+    event.client.message_type = property;
+    event.client.format = 32;
+    event.client.data.l[0] = before ? 0 : 1;
+    if (!api->send_event(display, event.client.window, 0,
+                         (1L << 19) | (1L << 20), &event))
+        return false;
+    api->sync(display, 0);
+    deadline = monotonic_milliseconds() + 400;
+    while (!stop_requested && monotonic_milliseconds() < deadline) {
+        bool current;
+
+        if (!show_desktop_state(api, display, property, &current))
+            return false;
+        if (current != before)
+            return true;
+        sleep_milliseconds(5);
+    }
+    return false;
+}
+
+static bool overview_dbus(bool setting, bool value, char *output,
+                           size_t capacity)
+{
+    int pipes[2];
+    pid_t child;
+    int status = 0;
+    bool reaped = false;
+    bool complete = false;
+    size_t used = 0;
+    uint64_t deadline;
+
+    if (capacity == 0 || pipe2(pipes, O_CLOEXEC | O_NONBLOCK) != 0)
+        return false;
+    output[0] = '\0';
+    child = fork();
+    if (child < 0) {
+        close(pipes[0]);
+        close(pipes[1]);
+        return false;
+    }
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0 ||
+            dup2(pipes[1], STDOUT_FILENO) < 0)
+            _exit(127);
+        closefrom(3);
+        if (setting)
+            execl("/usr/bin/gdbus", "gdbus", "call", "--session",
+                  "--timeout", "1", "--dest", "org.gnome.Shell",
+                  "--object-path", "/org/gnome/Shell", "--method",
+                  "org.freedesktop.DBus.Properties.Set", "org.gnome.Shell",
+                  "OverviewActive", value ? "<true>" : "<false>",
+                  (char *)NULL);
+        else
+            execl("/usr/bin/gdbus", "gdbus", "call", "--session",
+                  "--timeout", "1", "--dest", "org.gnome.Shell",
+                  "--object-path", "/org/gnome/Shell", "--method",
+                  "org.freedesktop.DBus.Properties.Get", "org.gnome.Shell",
+                  "OverviewActive", (char *)NULL);
+        _exit(127);
+    }
+    action_child_pid = child;
+    close(pipes[1]);
+    deadline = monotonic_milliseconds() + 600;
+    while (!stop_requested && monotonic_milliseconds() < deadline) {
+        char buffer[128];
+        ssize_t received = read(pipes[0], buffer, sizeof(buffer));
+
+        if (received > 0) {
+            if ((size_t)received >= capacity - used)
+                break;
+            memcpy(output + used, buffer, (size_t)received);
+            used += (size_t)received;
+            output[used] = '\0';
+        } else if (received == 0) {
+            complete = true;
+        } else if (errno != EAGAIN && errno != EINTR) {
+            break;
+        }
+        if (!reaped) {
+            pid_t result = waitpid(child, &status, WNOHANG);
+
+            if (result == child) {
+                reaped = true;
+                action_child_pid = -1;
+            } else if (result < 0 && errno != EINTR) {
+                break;
+            }
+        }
+        if (reaped && complete)
+            break;
+        sleep_milliseconds(2);
+    }
+    close(pipes[0]);
+    if (!reaped) {
+        kill(child, SIGKILL);
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+            ;
+    }
+    action_child_pid = -1;
+    return reaped && complete && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool overview_state(bool *active)
+{
+    char result[128];
+
+    if (!overview_dbus(false, false, result, sizeof(result)))
+        return false;
+    if (strcmp(result, "(<true>,)\n") == 0)
+        *active = true;
+    else if (strcmp(result, "(<false>,)\n") == 0)
+        *active = false;
+    else
+        return false;
+    return true;
+}
+
+static bool toggle_overview(void)
+{
+    bool before;
+    bool current;
+    char result[128];
+
+    if (!overview_state(&before) ||
+        !overview_dbus(true, !before, result, sizeof(result)))
+        return false;
+    return overview_state(&current) && current != before;
+}
+
+static bool write_fd_all(int fd, const void *buffer, size_t size)
+{
+    const unsigned char *position = buffer;
+
+    while (size > 0) {
+        ssize_t written = write(fd, position, size);
+
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+        if (written == 0)
+            return false;
+        position += (size_t)written;
+        size -= (size_t)written;
+    }
+    return true;
+}
+
+static void reset_selection_status(selection_status *status)
+{
+    memset(status, 0, sizeof(*status));
+}
+
+static void stop_selection_owner(volatile sig_atomic_t *owner_pid,
+                                 volatile sig_atomic_t *status_fd,
+                                 selection_status *status)
+{
+    pid_t pid = (pid_t)*owner_pid;
+    int fd = (int)*status_fd;
+    int wait_status;
+    unsigned int attempt;
+
+    *owner_pid = -1;
+    *status_fd = -1;
+    if (fd >= 0)
+        close(fd);
+    reset_selection_status(status);
+    if (pid <= 0)
+        return;
+    kill(pid, SIGTERM);
+    for (attempt = 0; attempt < 25; attempt++) {
+        pid_t result = waitpid(pid, &wait_status, WNOHANG);
+
+        if (result == pid || (result < 0 && errno == ECHILD))
+            return;
+        if (result < 0 && errno != EINTR)
+            break;
+        sleep_milliseconds(2);
+    }
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &wait_status, 0) < 0 && errno == EINTR)
+        ;
+}
+
+static void stop_clipboard_owner(void)
+{
+    stop_selection_owner(&clipboard_owner_pid, &clipboard_status_fd,
+                         &clipboard_status);
+    stop_selection_owner(&primary_owner_pid, &primary_status_fd,
+                         &primary_status);
+}
+
+static void update_selection_status(int fd, selection_status *status)
+{
+    if (fd < 0)
+        return;
+
+    for (;;) {
+        ssize_t received;
+        char *line_start;
+        char *newline;
+
+        if (status->length == sizeof(status->buffer) - 1)
+            status->length = 0;
+        received = read(fd, status->buffer + status->length,
+                        sizeof(status->buffer) - status->length - 1);
+        if (received < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            return;
+        }
+        if (received == 0)
+            break;
+        status->length += (size_t)received;
+        status->buffer[status->length] = '\0';
+        line_start = status->buffer;
+        while ((newline = strchr(line_start, '\n')) != NULL) {
+            static const char marker[] =
+                "Waiting for selection request number ";
+            char *number;
+
+            *newline = '\0';
+            if (strstr(line_start, "Lost selection ownership") != NULL)
+                status->ownership_lost = true;
+            if (strstr(line_start, "X Error") != NULL)
+                status->x_error = true;
+            number = strstr(line_start, marker);
+            if (number != NULL) {
+                char *end = NULL;
+                unsigned long parsed;
+
+                number += sizeof(marker) - 1;
+                parsed = strtoul(number, &end, 10);
+                if (end != number && parsed > status->next_request_number)
+                    status->next_request_number = parsed;
+            }
+            line_start = newline + 1;
+        }
+        if (line_start != status->buffer) {
+            size_t remaining = status->length -
+                               (size_t)(line_start - status->buffer);
+
+            memmove(status->buffer, line_start, remaining);
+            status->length = remaining;
+            status->buffer[remaining] = '\0';
+        }
+    }
+}
+
+static unsigned long completed_selection_requests(
+    const selection_status *status)
+{
+    return status->next_request_number > 0 ?
+           status->next_request_number - 1 : 0;
+}
+
+static bool selection_owner_alive(volatile sig_atomic_t *owner_pid)
+{
+    pid_t pid = (pid_t)*owner_pid;
+    int status;
+    pid_t result;
+
+    if (pid <= 0)
+        return false;
+    result = waitpid(pid, &status, WNOHANG);
+    if (result == 0 || (result < 0 && errno == EINTR))
+        return true;
+    if (result == pid && selection_error_reports < 64U) {
+        selection_status *details = owner_pid == &clipboard_owner_pid ?
+                                    &clipboard_status : &primary_status;
+        fprintf(stderr,
+                "semantic-owner-exit selection=%s exit=%d signal=%d lost=%d x-error=%d\n",
+                owner_pid == &clipboard_owner_pid ? "clipboard" : "primary",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                WIFSIGNALED(status) ? WTERMSIG(status) : 0,
+                details->ownership_lost, details->x_error);
+    }
+    if (result == pid || (result < 0 && errno == ECHILD)) {
+        volatile sig_atomic_t *status_fd =
+            owner_pid == &clipboard_owner_pid ? &clipboard_status_fd :
+                                               &primary_status_fd;
+        selection_status *details = owner_pid == &clipboard_owner_pid ?
+                                    &clipboard_status : &primary_status;
+        int fd = (int)*status_fd;
+
+        *owner_pid = -1;
+        *status_fd = -1;
+        if (fd >= 0)
+            close(fd);
+        reset_selection_status(details);
+    }
+    return false;
+}
+
+static bool selection_owners_quiet(unsigned long *clipboard_baseline,
+                                   unsigned long *primary_baseline)
+{
+    uint64_t deadline = monotonic_milliseconds() +
+                        UURB_SELECTION_READY_TIMEOUT_MS;
+    uint64_t quiet_since = monotonic_milliseconds();
+    unsigned long prior_clipboard = 0;
+    unsigned long prior_primary = 0;
+
+    while (!stop_requested && monotonic_milliseconds() <= deadline) {
+        unsigned long current_clipboard;
+        unsigned long current_primary;
+
+        update_selection_status((int)clipboard_status_fd,
+                                &clipboard_status);
+        update_selection_status((int)primary_status_fd, &primary_status);
+        current_clipboard = completed_selection_requests(&clipboard_status);
+        current_primary = completed_selection_requests(&primary_status);
+        if (current_clipboard != prior_clipboard ||
+            current_primary != prior_primary) {
+            prior_clipboard = current_clipboard;
+            prior_primary = current_primary;
+            quiet_since = monotonic_milliseconds();
+        }
+        if (clipboard_status.next_request_number > 0 &&
+            primary_status.next_request_number > 0 &&
+            monotonic_milliseconds() - quiet_since >=
+                UURB_SELECTION_QUIET_MS) {
+            *clipboard_baseline = current_clipboard;
+            *primary_baseline = current_primary;
+            return true;
+        }
+        if (!selection_owner_alive(&clipboard_owner_pid) ||
+            !selection_owner_alive(&primary_owner_pid)) {
+            report_selection_error("owner-exited-before-paste");
+            return false;
+        }
+        sleep_milliseconds(5);
+    }
+    return false;
+}
+
+static bool wait_for_selection_request(unsigned long clipboard_baseline,
+                                       unsigned long primary_baseline)
+{
+    uint64_t deadline = monotonic_milliseconds() +
+                        UURB_SELECTION_REQUEST_TIMEOUT_MS;
+
+    if (selection_transaction_deadline != 0 && selection_transaction_deadline < deadline)
+        deadline = selection_transaction_deadline;
+    while (!stop_requested && monotonic_milliseconds() <= deadline) {
+        update_selection_status((int)clipboard_status_fd,
+                                &clipboard_status);
+        update_selection_status((int)primary_status_fd, &primary_status);
+        if (completed_selection_requests(&clipboard_status) >
+                clipboard_baseline ||
+            completed_selection_requests(&primary_status) >
+                primary_baseline) {
+            sleep_milliseconds(UURB_SELECTION_POST_REQUEST_MS);
+            update_selection_status((int)clipboard_status_fd,
+                                    &clipboard_status);
+            update_selection_status((int)primary_status_fd,
+                                    &primary_status);
+            return true;
+        }
+        if (!selection_owner_alive(&clipboard_owner_pid) ||
+            !selection_owner_alive(&primary_owner_pid))
+            return false;
+        sleep_milliseconds(5);
+    }
+    return false;
+}
+
+static bool start_selection_owner(const x11_api *api, Display *display,
+                                  const char *selection_name,
+                                  const char *text, size_t size,
+                                  volatile sig_atomic_t *owner_pid,
+                                  volatile sig_atomic_t *status_fd,
+                                  selection_status *owner_status)
+{
+    int input_pipe[2];
+    int status_pipe[2];
+    int status_flags;
+    pid_t pid;
+    int status;
+    int null_fd;
+    unsigned int attempt;
+    Atom clipboard;
+    Window previous_owner;
+    Window current_owner = 0;
+
+    clipboard = api->intern_atom(display, selection_name, 0);
+    if (clipboard == 0)
+        return false;
+    api->sync(display, 0);
+    previous_owner = api->get_selection_owner(display, clipboard);
+    if (pipe2(input_pipe, O_CLOEXEC) != 0)
+        return false;
+    if (pipe2(status_pipe, O_CLOEXEC) != 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        return false;
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        return false;
+    }
+    if (pid == 0) {
+        if (dup2(input_pipe[0], STDIN_FILENO) < 0)
+            _exit(126);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        close(status_pipe[0]);
+        if (dup2(status_pipe[1], STDERR_FILENO) < 0)
+            _exit(126);
+        close(status_pipe[1]);
+        null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDOUT_FILENO);
+            close(null_fd);
+        }
+        setenv("LC_ALL", "C.UTF-8", 1);
+        execl("/usr/bin/xclip", "xclip", "-selection", selection_name,
+              "-in", "-loops", "0", "-verbose", (char *)NULL);
+        _exit(127);
+    }
+
+    close(input_pipe[0]);
+    close(status_pipe[1]);
+    *owner_pid = (sig_atomic_t)pid;
+    *status_fd = (sig_atomic_t)status_pipe[0];
+    reset_selection_status(owner_status);
+    status_flags = fcntl(status_pipe[0], F_GETFL);
+    if (status_flags < 0 ||
+        fcntl(status_pipe[0], F_SETFL, status_flags | O_NONBLOCK) < 0) {
+        close(input_pipe[1]);
+        stop_selection_owner(owner_pid, status_fd, owner_status);
+        return false;
+    }
+    if (!write_fd_all(input_pipe[1], text, size)) {
+        close(input_pipe[1]);
+        stop_selection_owner(owner_pid, status_fd, owner_status);
+        return false;
+    }
+    close(input_pipe[1]);
+
+    /* Never paste on the strength of a timer alone.  A busy desktop can leave
+     * xclip alive but not yet owning CLIPBOARD, which would make Shift+Insert
+     * paste stale user data.  Wait for a new, non-None owner and fail closed. */
+    for (attempt = 0; attempt < 100; attempt++) {
+        pid_t result;
+
+        api->sync(display, 0);
+        current_owner = api->get_selection_owner(display, clipboard);
+        if (current_owner != 0 && current_owner != previous_owner)
+            break;
+        result = waitpid(pid, &status, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) {
+            *owner_pid = -1;
+            return false;
+        }
+        if (result < 0 && errno != EINTR)
+            break;
+        sleep_milliseconds(5);
+    }
+    if (current_owner == 0 || current_owner == previous_owner) {
+        stop_selection_owner(owner_pid, status_fd, owner_status);
+        return false;
+    }
+    return true;
+}
+
+static bool start_clipboard_owner(const x11_api *api, Display *display,
+                                  const char *text, size_t size,
+                                  unsigned long *clipboard_baseline,
+                                  unsigned long *primary_baseline)
+{
+    volatile sig_atomic_t old_clipboard_pid = clipboard_owner_pid;
+    volatile sig_atomic_t old_primary_pid = primary_owner_pid;
+    volatile sig_atomic_t old_clipboard_fd = clipboard_status_fd;
+    volatile sig_atomic_t old_primary_fd = primary_status_fd;
+    selection_status old_clipboard_status = clipboard_status;
+    selection_status old_primary_status = primary_status;
+    bool ready = false;
+
+    /* Keep the previous owners alive until XSetSelectionOwner replaces them.
+     * Killing them first creates a None-owner gap. GNOME can restore its
+     * cached selection during that gap, racing and displacing the NEW xclip
+     * before paste. An ownership handoff must not look like a clipboard loss. */
+    clipboard_owner_pid = primary_owner_pid = -1;
+    clipboard_status_fd = primary_status_fd = -1;
+    if (!start_selection_owner(api, display, "CLIPBOARD", text, size,
+                               &clipboard_owner_pid, &clipboard_status_fd,
+                               &clipboard_status)) {
+        report_selection_error("clipboard-start");
+        goto failed;
+    }
+    if (!start_selection_owner(api, display, "PRIMARY", text, size,
+                               &primary_owner_pid, &primary_status_fd,
+                               &primary_status)) {
+        report_selection_error("primary-start");
+        goto failed;
+    }
+    if (!selection_owners_quiet(clipboard_baseline, primary_baseline)) {
+        report_selection_error("owner-readiness");
+        goto failed;
+    }
+    ready = true;
+failed:
+    stop_selection_owner(&old_clipboard_pid, &old_clipboard_fd,
+                         &old_clipboard_status);
+    stop_selection_owner(&old_primary_pid, &old_primary_fd,
+                         &old_primary_status);
+    if (!ready)
+        stop_clipboard_owner();
+    return ready;
+}
+
+static bool append_utf8(char *output, size_t capacity, size_t *length,
+                        uint32_t codepoint)
+{
+    unsigned int bytes;
+
+    if (codepoint == 0 || codepoint > UINT32_C(0x10ffff) ||
+        (codepoint >= UINT32_C(0xd800) &&
+         codepoint <= UINT32_C(0xdfff)))
+        return false;
+    if (codepoint <= UINT32_C(0x7f))
+        bytes = 1;
+    else if (codepoint <= UINT32_C(0x7ff))
+        bytes = 2;
+    else if (codepoint <= UINT32_C(0xffff))
+        bytes = 3;
+    else
+        bytes = 4;
+    if (*length + bytes >= capacity)
+        return false;
+
+    if (bytes == 1) {
+        output[(*length)++] = (char)codepoint;
+    } else if (bytes == 2) {
+        output[(*length)++] = (char)(UINT32_C(0xc0) | (codepoint >> 6));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     (codepoint & UINT32_C(0x3f)));
+    } else if (bytes == 3) {
+        output[(*length)++] = (char)(UINT32_C(0xe0) | (codepoint >> 12));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     ((codepoint >> 6) & UINT32_C(0x3f)));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     (codepoint & UINT32_C(0x3f)));
+    } else {
+        output[(*length)++] = (char)(UINT32_C(0xf0) | (codepoint >> 18));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     ((codepoint >> 12) & UINT32_C(0x3f)));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     ((codepoint >> 6) & UINT32_C(0x3f)));
+        output[(*length)++] = (char)(UINT32_C(0x80) |
+                                     (codepoint & UINT32_C(0x3f)));
+    }
+    return true;
+}
+
+static bool valid_text_event(const uurb_x11_input_event *event)
+{
+    return event->type == UURB_X11_INPUT_TEXT && event->flags == 0 &&
+           event->x == 0 && event->y == 0 && event->virtual_key == 0 &&
+           event->scan_code == 0 && event->data <= UINT32_C(0xffff);
+}
+
+static bool text_events_to_utf8(const uurb_x11_input_event *events,
+                                uint32_t count, char *output,
+                                size_t capacity, size_t *length,
+                                bool *previous_ended_cr,
+                                uint32_t *pending_high_surrogate)
+{
+    uint32_t index = 0;
+
+    *length = 0;
+    if (*pending_high_surrogate != 0) {
+        uint32_t low;
+        uint32_t codepoint;
+
+        if (!valid_text_event(&events[0])) {
+            *pending_high_surrogate = 0;
+            return false;
+        }
+        low = events[0].data;
+        if (low < UINT32_C(0xdc00) || low > UINT32_C(0xdfff)) {
+            *pending_high_surrogate = 0;
+            return false;
+        }
+        codepoint = UINT32_C(0x10000) +
+                    ((*pending_high_surrogate - UINT32_C(0xd800)) << 10) +
+                    (low - UINT32_C(0xdc00));
+        *pending_high_surrogate = 0;
+        if (!append_utf8(output, capacity, length, codepoint))
+            return false;
+        index = 1;
+    }
+    for (; index < count; index++) {
+        uint32_t unit;
+        uint32_t codepoint;
+
+        if (!valid_text_event(&events[index]))
+            return false;
+        unit = events[index].data;
+        if (unit == (uint32_t)'\n' && *previous_ended_cr) {
+            *previous_ended_cr = false;
+            continue;
+        }
+        *previous_ended_cr = false;
+        if (unit == (uint32_t)'\r') {
+            codepoint = (uint32_t)'\n';
+            if (index + 1 < count &&
+                valid_text_event(&events[index + 1]) &&
+                events[index + 1].data == (uint32_t)'\n') {
+                index++;
+            } else {
+                *previous_ended_cr = true;
+            }
+        } else if (unit >= UINT32_C(0xd800) &&
+                   unit <= UINT32_C(0xdbff)) {
+            uint32_t low;
+
+            if (index + 1 >= count) {
+                *pending_high_surrogate = unit;
+                continue;
+            }
+            if (!valid_text_event(&events[index + 1]))
+                return false;
+            low = events[++index].data;
+            if (low < UINT32_C(0xdc00) || low > UINT32_C(0xdfff))
+                return false;
+            codepoint = UINT32_C(0x10000) +
+                        ((unit - UINT32_C(0xd800)) << 10) +
+                        (low - UINT32_C(0xdc00));
+        } else if (unit >= UINT32_C(0xdc00) &&
+                   unit <= UINT32_C(0xdfff)) {
+            return false;
+        } else {
+            codepoint = unit;
+        }
+        if (!append_utf8(output, capacity, length, codepoint))
+            return false;
+    }
+    output[*length] = '\0';
+    return true;
+}
+
+/* These transactions never call XTest or change input focus. They retain
+ * one epoch on this authenticated connection until an acknowledged public
+ * RDP chord is followed by a new selection request. This observes selection
+ * activity, not recipient text; background readers can also request data. */
+static bool selection_transaction_current(const x11_api *api, Display *display,
+                                           const selection_transaction *transaction)
+{
+    Atom clipboard = api->intern_atom(display, "CLIPBOARD", 0);
+    Atom primary = api->intern_atom(display, "PRIMARY", 0);
+
+    if (!transaction->pending || clipboard == 0 || primary == 0 ||
+        (pid_t)clipboard_owner_pid != transaction->clipboard_pid ||
+        (pid_t)primary_owner_pid != transaction->primary_pid ||
+        !selection_owner_alive(&clipboard_owner_pid) ||
+        !selection_owner_alive(&primary_owner_pid))
+        return false;
+    update_selection_status((int)clipboard_status_fd, &clipboard_status);
+    update_selection_status((int)primary_status_fd, &primary_status);
+    api->sync(display, 0);
+    return !clipboard_status.ownership_lost && !primary_status.ownership_lost &&
+           !clipboard_status.x_error && !primary_status.x_error &&
+           api->get_selection_owner(display, clipboard) == transaction->clipboard_window &&
+           api->get_selection_owner(display, primary) == transaction->primary_window;
+}
+
+static void cancel_selection_transaction(selection_transaction *transaction)
+{
+    if (transaction->pending)
+        stop_clipboard_owner();
+    transaction->pending = false;
+    selection_transaction_deadline = 0;
+}
+
+static bool begin_selection_transaction(const x11_api *api, Display *display,
+                                        const char *text, size_t size,
+                                        uint32_t sequence, bool ended_cr,
+                                        selection_transaction *transaction)
+{
+    Atom clipboard;
+    Atom primary;
+
+    if (transaction->pending || size == 0 || sequence == 0 ||
+        sequence <= transaction->last_sequence)
+        return false;
+    if (!start_clipboard_owner(api, display, text, size,
+                               &transaction->clipboard_baseline,
+                               &transaction->primary_baseline))
+        return false;
+    transaction->pending = true;
+    transaction->sequence = sequence;
+    transaction->last_sequence = sequence;
+    transaction->clipboard_pid = (pid_t)clipboard_owner_pid;
+    transaction->primary_pid = (pid_t)primary_owner_pid;
+    transaction->ended_cr = ended_cr;
+    clipboard = api->intern_atom(display, "CLIPBOARD", 0);
+    primary = api->intern_atom(display, "PRIMARY", 0);
+    transaction->clipboard_window = clipboard ? api->get_selection_owner(display, clipboard) : 0;
+    transaction->primary_window = primary ? api->get_selection_owner(display, primary) : 0;
+    selection_transaction_deadline = monotonic_milliseconds() +
+                                     UURB_SELECTION_TRANSACTION_TIMEOUT_MS;
+    if (transaction->clipboard_window == 0 || transaction->primary_window == 0 ||
+        !selection_transaction_current(api, display, transaction)) {
+        cancel_selection_transaction(transaction);
+        return false;
+    }
+    return true;
+}
+
+static bool finish_selection_transaction(const x11_api *api, Display *display,
+                                         uint32_t sequence, uint32_t owner_sequence,
+                                         selection_transaction *transaction)
+{
+    bool success = transaction->pending &&
+                   sequence > transaction->sequence &&
+                   owner_sequence == transaction->sequence &&
+                   selection_transaction_deadline != 0 &&
+                   monotonic_milliseconds() < selection_transaction_deadline &&
+                   selection_transaction_current(api, display, transaction) &&
+                   wait_for_selection_request(transaction->clipboard_baseline,
+                                               transaction->primary_baseline) &&
+                   monotonic_milliseconds() < selection_transaction_deadline &&
+                   selection_transaction_current(api, display, transaction);
+
+    if (!success) {
+        cancel_selection_transaction(transaction);
+        return false;
+    }
+    transaction->last_sequence = sequence;
+    transaction->pending = false;
+    selection_transaction_deadline = 0;
+    return true;
+}
+
+static bool inject_clipboard_text(const x11_api *api,
+                                  Display *clipboard_display,
+                                  Display *injection_display,
+                                  const char *text, size_t size,
+                                  bool pressed_keys[256])
+{
+    const KeySym shift_left = 0xffe1UL;
+    const KeySym insert = 0xff63UL;
+    unsigned int shift_keycode;
+    unsigned int insert_keycode;
+    bool shift_was_pressed;
+    bool shift_pressed_here = false;
+    bool insert_pressed = false;
+    uint64_t key_delay_ms;
+    unsigned long clipboard_baseline;
+    unsigned long primary_baseline;
+
+    if (size == 0)
+        return true;
+    shift_keycode = api->keysym_to_keycode(injection_display, shift_left);
+    insert_keycode = api->keysym_to_keycode(injection_display, insert);
+    if (shift_keycode == 0 || shift_keycode >= 256 ||
+        insert_keycode == 0 || insert_keycode >= 256 ||
+        !start_clipboard_owner(api, clipboard_display, text, size,
+                               &clipboard_baseline, &primary_baseline))
+        return false;
+
+    shift_was_pressed = pressed_keys[shift_keycode];
+    key_delay_ms = injection_display == clipboard_display ? 0 :
+                   UURB_RELAY_PASTE_KEY_DELAY_MS;
+    if (!shift_was_pressed) {
+        if (!api->fake_key_event(injection_display, shift_keycode, 1, 0))
+            goto injection_failed;
+        shift_pressed_here = true;
+        api->sync(injection_display, 0);
+        sleep_milliseconds(key_delay_ms);
+    }
+    if (!api->fake_key_event(injection_display, insert_keycode, 1, 0))
+        goto injection_failed;
+    insert_pressed = true;
+    api->sync(injection_display, 0);
+    sleep_milliseconds(key_delay_ms);
+    if (!api->fake_key_event(injection_display, insert_keycode, 0, 0))
+        goto injection_failed;
+    insert_pressed = false;
+    api->sync(injection_display, 0);
+    sleep_milliseconds(key_delay_ms);
+    if (shift_pressed_here) {
+        if (!api->fake_key_event(injection_display, shift_keycode, 0, 0))
+            goto injection_failed;
+        shift_pressed_here = false;
+    }
+    api->sync(injection_display, 0);
+
+    /* xclip announces each completed selection request on its private status
+     * pipe. Initial clipboard-manager reads are allowed to settle before the
+     * paste, then at least one new request must follow the synthetic chord.
+     * Do not grant revision credit merely because ownership changed. */
+    if (!wait_for_selection_request(clipboard_baseline, primary_baseline)) {
+        report_selection_error("post-paste-request");
+        stop_clipboard_owner();
+        return false;
+    }
+    return true;
+
+injection_failed:
+    if (insert_pressed)
+        api->fake_key_event(injection_display, insert_keycode, 0, 0);
+    if (shift_pressed_here)
+        api->fake_key_event(injection_display, shift_keycode, 0, 0);
+    api->sync(injection_display, 0);
+    stop_clipboard_owner();
+    return false;
+}
+
+static KeySym extended_scan_to_keysym(unsigned int scan)
+{
+    switch (scan) {
+    case 0x1c:
+        return 0xff8dUL; /* XK_KP_Enter */
+    case 0x1d:
+        return 0xffe4UL; /* XK_Control_R */
+    case 0x35:
+        return 0xffafUL; /* XK_KP_Divide */
+    case 0x37:
+        return 0xff61UL; /* XK_Print */
+    case 0x38:
+        return 0xffeaUL; /* XK_Alt_R */
+    case 0x47:
+        return 0xff50UL; /* XK_Home */
+    case 0x48:
+        return 0xff52UL; /* XK_Up */
+    case 0x49:
+        return 0xff55UL; /* XK_Prior */
+    case 0x4b:
+        return 0xff51UL; /* XK_Left */
+    case 0x4d:
+        return 0xff53UL; /* XK_Right */
+    case 0x4f:
+        return 0xff57UL; /* XK_End */
+    case 0x50:
+        return 0xff54UL; /* XK_Down */
+    case 0x51:
+        return 0xff56UL; /* XK_Next */
+    case 0x52:
+        return 0xff63UL; /* XK_Insert */
+    case 0x53:
+        return 0xffffUL; /* XK_Delete */
+    case 0x5b:
+        return 0xffebUL; /* XK_Super_L */
+    case 0x5c:
+        return 0xffecUL; /* XK_Super_R */
+    case 0x5d:
+        return 0xff67UL; /* XK_Menu */
+    default:
+        return 0;
+    }
+}
+
+static unsigned int event_to_x_keycode(const x11_api *api, Display *display,
+                                       const uurb_x11_input_event *event)
+{
+    unsigned int scan = event->scan_code & 0xffU;
+
+    if (scan == 0 || (event->flags & UURB_KEYEVENTF_UNICODE) != 0)
+        return 0;
+    if ((event->flags & UURB_KEYEVENTF_EXTENDED) != 0) {
+        KeySym keysym = extended_scan_to_keysym(scan);
+
+        if (keysym == 0)
+            return 0;
+        return api->keysym_to_keycode(display, keysym);
+    }
+    if (scan > 247U)
+        return 0;
+    return scan + 8U;
+}
+
+static bool valid_mouse_event(const uurb_x11_input_event *event)
+{
+    const uint32_t allowed_flags =
+        UURB_MOUSEEVENTF_MOVE | UURB_MOUSEEVENTF_LEFTDOWN |
+        UURB_MOUSEEVENTF_LEFTUP | UURB_MOUSEEVENTF_RIGHTDOWN |
+        UURB_MOUSEEVENTF_RIGHTUP | UURB_MOUSEEVENTF_MIDDLEDOWN |
+        UURB_MOUSEEVENTF_MIDDLEUP | UURB_MOUSEEVENTF_XDOWN |
+        UURB_MOUSEEVENTF_XUP | UURB_MOUSEEVENTF_WHEEL |
+        UURB_MOUSEEVENTF_HWHEEL | UURB_MOUSEEVENTF_MOVE_NOCOALESCE |
+        UURB_MOUSEEVENTF_VIRTUALDESK | UURB_MOUSEEVENTF_ABSOLUTE;
+    uint32_t xbutton;
+
+    if ((event->flags & ~allowed_flags) != 0)
+        return false;
+    if ((event->flags & (UURB_MOUSEEVENTF_WHEEL |
+                         UURB_MOUSEEVENTF_HWHEEL)) ==
+        (UURB_MOUSEEVENTF_WHEEL | UURB_MOUSEEVENTF_HWHEEL))
+        return false;
+    if ((event->flags & (UURB_MOUSEEVENTF_WHEEL |
+                         UURB_MOUSEEVENTF_HWHEEL)) != 0 &&
+        (int32_t)event->data == 0)
+        return false;
+    if ((event->flags & (UURB_MOUSEEVENTF_XDOWN |
+                         UURB_MOUSEEVENTF_XUP)) == 0)
+        return true;
+
+    xbutton = event->data & UINT32_C(0xffff);
+    return xbutton == 1U || xbutton == 2U;
+}
+
+static int normalized_coordinate(int32_t value, int extent)
+{
+    int64_t clamped = value;
+
+    if (clamped < 0)
+        clamped = 0;
+    if (clamped > 65535)
+        clamped = 65535;
+    if (extent <= 1)
+        return 0;
+    return (int)((clamped * (extent - 1) + 32767) / 65535);
+}
+
+static bool fake_button(const x11_api *api, Display *display,
+                        unsigned int button, bool press,
+                        bool pressed_buttons[10])
+{
+    if (button == 0 || button >= 10 ||
+        !api->fake_button_event(display, button, press ? 1 : 0, 0))
+        return false;
+    pressed_buttons[button] = press;
+    return true;
+}
+
+static unsigned int wheel_steps(int32_t delta)
+{
+    int64_t magnitude = delta;
+    uint64_t steps;
+
+    if (magnitude < 0)
+        magnitude = -magnitude;
+    steps = ((uint64_t)magnitude + UINT64_C(119)) / UINT64_C(120);
+    if (steps > 32U)
+        steps = 32U;
+    return (unsigned int)steps;
+}
+
+static bool fake_wheel(const x11_api *api, Display *display,
+                       unsigned int button, unsigned int steps,
+                       bool pressed_buttons[10])
+{
+    unsigned int index;
+
+    for (index = 0; index < steps; index++) {
+        if (!fake_button(api, display, button, true, pressed_buttons) ||
+            !fake_button(api, display, button, false, pressed_buttons))
+            return false;
+    }
+    return true;
+}
+
+static bool inject_mouse_event(const x11_api *api, Display *display,
+                               const uurb_x11_input_event *event,
+                               bool pressed_buttons[10])
+{
+    uint32_t flags = event->flags;
+
+    if ((flags & UURB_MOUSEEVENTF_MOVE) != 0) {
+        if ((flags & UURB_MOUSEEVENTF_ABSOLUTE) != 0) {
+            int screen = api->default_screen(display);
+            Window root;
+            int root_x, root_y;
+            unsigned int width, height, border, depth;
+
+            /* XDisplayWidth/Height cache the connection's initial size.
+             * Native Windows display changes can resize this root live. */
+            if (!api->get_geometry(display, api->default_root_window(display),
+                    &root, &root_x, &root_y, &width, &height, &border, &depth) ||
+                width == 0 || height == 0 || width > INT_MAX || height > INT_MAX)
+                return false;
+
+            if (!api->fake_motion_event(
+                    display, screen,
+                    normalized_coordinate(event->x, width),
+                    normalized_coordinate(event->y, height), 0))
+                return false;
+        } else if (!api->fake_relative_motion_event(
+                       display, event->x, event->y, 0)) {
+            return false;
+        }
+    }
+    if ((flags & UURB_MOUSEEVENTF_LEFTDOWN) != 0 &&
+        !fake_button(api, display, 1, true, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_LEFTUP) != 0 &&
+        !fake_button(api, display, 1, false, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_RIGHTDOWN) != 0 &&
+        !fake_button(api, display, 3, true, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_RIGHTUP) != 0 &&
+        !fake_button(api, display, 3, false, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_MIDDLEDOWN) != 0 &&
+        !fake_button(api, display, 2, true, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_MIDDLEUP) != 0 &&
+        !fake_button(api, display, 2, false, pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_XDOWN) != 0 &&
+        !fake_button(api, display,
+                     (event->data & UINT32_C(0xffff)) == 1U ? 8U : 9U, true,
+                     pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_XUP) != 0 &&
+        !fake_button(api, display,
+                     (event->data & UINT32_C(0xffff)) == 1U ? 8U : 9U, false,
+                     pressed_buttons))
+        return false;
+    if ((flags & UURB_MOUSEEVENTF_WHEEL) != 0) {
+        int32_t delta = (int32_t)event->data;
+
+        if (!fake_wheel(api, display, delta > 0 ? 4U : 5U,
+                        wheel_steps(delta), pressed_buttons))
+            return false;
+    }
+    if ((flags & UURB_MOUSEEVENTF_HWHEEL) != 0) {
+        int32_t delta = (int32_t)event->data;
+
+        if (!fake_wheel(api, display, delta > 0 ? 7U : 6U,
+                        wheel_steps(delta), pressed_buttons))
+            return false;
+    }
+    return true;
+}
+
+/* POSIX dlsym returns an object pointer. Preserve the typed destination only
+ * when pointer sizes match, without ISO-C object/function pointer casts. */
+static bool load_symbol(void *library, const char *name, void *destination, size_t size)
+{
+    void *symbol = dlsym(library, name);
+
+    if (symbol == NULL || size != sizeof(symbol))
+        return false;
+    memcpy(destination, &symbol, size);
+    return true;
+}
+
+static bool load_x11_api(x11_api *api)
+{
+    int event_base;
+    int error_base;
+    int major;
+    int minor;
+    Display *display;
+
+    memset(api, 0, sizeof(*api));
+    api->x11_library = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+    api->xtst_library = dlopen("libXtst.so.6", RTLD_NOW | RTLD_LOCAL);
+    if (!api->x11_library || !api->xtst_library)
+        return false;
+
+    if (!load_symbol(api->x11_library, "XOpenDisplay", &api->open_display, sizeof(api->open_display)) ||
+        !load_symbol(api->x11_library, "XCloseDisplay", &api->close_display, sizeof(api->close_display)) ||
+        !load_symbol(api->x11_library, "XSync", &api->sync, sizeof(api->sync)) ||
+        !load_symbol(api->x11_library, "XInternAtom", &api->intern_atom, sizeof(api->intern_atom)) ||
+        !load_symbol(api->x11_library, "XGetSelectionOwner", &api->get_selection_owner, sizeof(api->get_selection_owner)) ||
+        !load_symbol(api->x11_library, "XDefaultScreen", &api->default_screen, sizeof(api->default_screen)) ||
+        !load_symbol(api->x11_library, "XGetGeometry", &api->get_geometry, sizeof(api->get_geometry)) ||
+        !load_symbol(api->x11_library, "XKeysymToKeycode", &api->keysym_to_keycode, sizeof(api->keysym_to_keycode)) ||
+        !load_symbol(api->x11_library, "XDefaultRootWindow", &api->default_root_window, sizeof(api->default_root_window)) ||
+        !load_symbol(api->x11_library, "XGetWindowProperty", &api->get_window_property, sizeof(api->get_window_property)) ||
+        !load_symbol(api->x11_library, "XFree", &api->free_data, sizeof(api->free_data)) ||
+        !load_symbol(api->x11_library, "XSendEvent", &api->send_event, sizeof(api->send_event)) ||
+        !load_symbol(api->xtst_library, "XTestQueryExtension", &api->query_extension, sizeof(api->query_extension)) ||
+        !load_symbol(api->xtst_library, "XTestFakeKeyEvent", &api->fake_key_event, sizeof(api->fake_key_event)) ||
+        !load_symbol(api->xtst_library, "XTestFakeButtonEvent", &api->fake_button_event, sizeof(api->fake_button_event)) ||
+        !load_symbol(api->xtst_library, "XTestFakeMotionEvent", &api->fake_motion_event, sizeof(api->fake_motion_event)) ||
+        !load_symbol(api->xtst_library, "XTestFakeRelativeMotionEvent", &api->fake_relative_motion_event, sizeof(api->fake_relative_motion_event)))
+        return false;
+    if (!api->open_display || !api->close_display || !api->sync ||
+        !api->intern_atom || !api->get_selection_owner ||
+        !api->default_screen || !api->get_geometry || !api->keysym_to_keycode ||
+        !api->default_root_window || !api->get_window_property ||
+        !api->free_data || !api->send_event ||
+        !api->query_extension || !api->fake_key_event ||
+        !api->fake_button_event || !api->fake_motion_event ||
+        !api->fake_relative_motion_event)
+        return false;
+
+    display = api->open_display(NULL);
+    if (!display)
+        return false;
+    if (!api->query_extension(display, &event_base, &error_base, &major,
+                              &minor)) {
+        api->close_display(display);
+        return false;
+    }
+    api->close_display(display);
+    return true;
+}
+
+static void unload_x11_api(x11_api *api)
+{
+    if (api->xtst_library)
+        dlclose(api->xtst_library);
+    if (api->x11_library)
+        dlclose(api->x11_library);
+    memset(api, 0, sizeof(*api));
+}
+
+static bool valid_token(const char *token)
+{
+    size_t index;
+
+    if (!token || strlen(token) != UURB_X11_INPUT_TOKEN_SIZE)
+        return false;
+    for (index = 0; index < UURB_X11_INPUT_TOKEN_SIZE; index++) {
+        if (!isxdigit((unsigned char)token[index]))
+            return false;
+    }
+    return true;
+}
+
+static bool publish_port(const char *path, unsigned int port)
+{
+    char value[32];
+    int fd;
+    int length;
+    ssize_t written;
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    length = snprintf(value, sizeof(value), "%u\n", port);
+    written = write(fd, value, (size_t)length);
+    if (written == length)
+        fsync(fd);
+    close(fd);
+    return written == length;
+}
+
+static int create_listener(const char *ready_file)
+{
+    struct sockaddr_in address;
+    socklen_t address_size = sizeof(address);
+    int fd;
+
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return -1;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(fd, 1) != 0 ||
+        getsockname(fd, (struct sockaddr *)&address, &address_size) != 0 ||
+        !publish_port(ready_file, ntohs(address.sin_port))) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void release_pressed_inputs(x11_api *api, Display *display,
+                                   bool pressed_keys[256],
+                                   bool pressed_buttons[10])
+{
+    unsigned int keycode;
+    unsigned int button;
+    bool changed = false;
+
+    for (keycode = 8; keycode < 256; keycode++) {
+        if (!pressed_keys[keycode])
+            continue;
+        api->fake_key_event(display, keycode, 0, 0);
+        pressed_keys[keycode] = false;
+        changed = true;
+    }
+    for (button = 1; button < 10; button++) {
+        if (!pressed_buttons[button])
+            continue;
+        api->fake_button_event(display, button, 0, 0);
+        pressed_buttons[button] = false;
+        changed = true;
+    }
+    if (changed)
+        api->sync(display, 0);
+}
+
+static bool send_response(int client, uint32_t sequence, uint32_t result,
+                          uint32_t error)
+{
+    uurb_x11_response response;
+
+    response.magic = UURB_X11_INPUT_MAGIC;
+    response.sequence = sequence;
+    response.result = result;
+    response.error = error;
+    return write_all(client, &response, sizeof(response));
+}
+
+static void serve_client(int client, const char *token, x11_api *api,
+                         Display *clipboard_display,
+                         Display *injection_display,
+                         unsigned int minimum_hold_ms)
+{
+    bool pressed_keys[256] = {false};
+    bool pressed_buttons[10] = {false};
+    uint64_t pressed_at[256] = {0};
+    bool previous_text_ended_cr = false;
+    uint32_t pending_high_surrogate = 0;
+    selection_transaction transaction = {0};
+    uurb_x11_handshake handshake;
+
+    selection_transaction_deadline = 0;
+
+    if (!read_all(client, &handshake, sizeof(handshake)) ||
+        handshake.magic != UURB_X11_INPUT_MAGIC ||
+        handshake.version != UURB_X11_INPUT_VERSION ||
+        memcmp(handshake.token, token, UURB_X11_INPUT_TOKEN_SIZE) != 0 ||
+        !send_response(client, 0, 1, 0))
+        return;
+
+    while (!stop_requested) {
+        uurb_x11_input_event events[UURB_X11_INPUT_MAX_EVENTS];
+        unsigned int keycodes[UURB_X11_INPUT_MAX_EVENTS];
+        uurb_x11_request request;
+        uint32_t index;
+        uint32_t injected = 0;
+        uint32_t error = 0;
+        bool text_request;
+
+        if (!read_all(client, &request, sizeof(request)))
+            break;
+        if (request.magic != UURB_X11_INPUT_MAGIC || request.reserved != 0 ||
+            request.count == 0 ||
+            request.count > UURB_X11_INPUT_MAX_EVENTS) {
+            send_response(client, request.sequence, 0,
+                          UURB_X11_ERROR_BAD_REQUEST);
+            break;
+        }
+        if (!read_all(client, events,
+                      request.count * sizeof(events[0])))
+            break;
+
+        if (events[0].type == UURB_X11_CLIPBOARD_BARRIER) {
+            const uurb_x11_input_event *event = &events[0];
+            bool valid = request.count == 1 && event->flags == 0 &&
+                         event->x == 0 && event->y == 0 &&
+                         event->virtual_key == 0 && event->scan_code == 0;
+            bool success = valid && finish_selection_transaction(api, clipboard_display,
+                                   request.sequence, event->data, &transaction);
+            if (!success)
+                cancel_selection_transaction(&transaction);
+            if (success)
+                previous_text_ended_cr = transaction.ended_cr;
+            if (!send_response(client, request.sequence, success ? 1 : 0,
+                               success ? 0 : UURB_X11_ERROR_INJECTION))
+                break;
+            continue;
+        }
+        if (transaction.pending) {
+            /* A client cannot replace/reuse an in-flight owner epoch or run
+             * other helper actions between ownership and its paste barrier. */
+            cancel_selection_transaction(&transaction);
+            if (!send_response(client, request.sequence, 0, UURB_X11_ERROR_BAD_REQUEST))
+                break;
+            continue;
+        }
+        if (events[0].type == UURB_X11_CLIPBOARD_OWNER_ONLY) {
+            char text[UURB_X11_INPUT_MAX_EVENTS * 4U + 1U];
+            size_t text_length = 0;
+            bool ended_cr = previous_text_ended_cr;
+            uint32_t pending = 0;
+            bool valid = true;
+
+            for (index = 0; index < request.count; ++index) {
+                if (events[index].type != UURB_X11_CLIPBOARD_OWNER_ONLY) {
+                    valid = false;
+                    break;
+                }
+                events[index].type = UURB_X11_INPUT_TEXT;
+            }
+            valid = valid && text_events_to_utf8(events, request.count, text,
+                        sizeof(text), &text_length, &ended_cr, &pending) &&
+                        pending == 0 && text_length != 0;
+            bool success = valid && begin_selection_transaction(api, clipboard_display,
+                                    text, text_length, request.sequence, ended_cr,
+                                    &transaction);
+            if (!send_response(client, request.sequence, success ? request.count : 0,
+                               success ? 0 : valid ? UURB_X11_ERROR_INJECTION :
+                                                    UURB_X11_ERROR_UNSUPPORTED))
+                break;
+            continue;
+        }
+
+        if (events[0].type == UURB_X11_INPUT_HOST_ACTION) {
+            const uurb_x11_input_event *event = &events[0];
+            bool success;
+
+            if (request.count != 1 || event->flags != 0 || event->x != 0 ||
+                event->y != 0 || event->virtual_key != 0 ||
+                event->scan_code != 0 ||
+                (event->data != UURB_HOST_ACTION_SHOW_DESKTOP &&
+                 event->data != UURB_HOST_ACTION_SHOW_WINDOWS)) {
+                if (!send_response(client, request.sequence, 0,
+                                   UURB_X11_ERROR_UNSUPPORTED))
+                    break;
+                continue;
+            }
+            success = event->data == UURB_HOST_ACTION_SHOW_DESKTOP ?
+                toggle_show_desktop(api, clipboard_display) :
+                toggle_overview();
+            if (!send_response(client, request.sequence, success ? 1 : 0,
+                               success ? 0 : UURB_X11_ERROR_INJECTION))
+                break;
+            continue;
+        }
+
+        text_request = events[0].type == UURB_X11_INPUT_TEXT;
+        if (text_request) {
+            char text[UURB_X11_INPUT_MAX_EVENTS * 4U + 1U];
+            size_t text_length;
+            bool ended_cr = previous_text_ended_cr;
+
+            if (!text_events_to_utf8(events, request.count, text,
+                                     sizeof(text), &text_length,
+                                     &ended_cr,
+                                     &pending_high_surrogate)) {
+                if (!send_response(client, request.sequence, 0,
+                                   UURB_X11_ERROR_UNSUPPORTED))
+                    break;
+                continue;
+            }
+            if (!inject_clipboard_text(api, clipboard_display,
+                                       injection_display, text, text_length,
+                                       pressed_keys)) {
+                if (!send_response(client, request.sequence, 0,
+                                   UURB_X11_ERROR_INJECTION))
+                    break;
+                continue;
+            }
+            previous_text_ended_cr = ended_cr;
+            if (!send_response(client, request.sequence, request.count, 0))
+                break;
+            continue;
+        }
+
+        for (index = 0; index < request.count; index++) {
+            keycodes[index] = 0;
+            if (events[index].type == UURB_X11_INPUT_KEYBOARD)
+                keycodes[index] = event_to_x_keycode(api, injection_display,
+                                                     &events[index]);
+            else if (events[index].type != UURB_X11_INPUT_MOUSE ||
+                     !valid_mouse_event(&events[index])) {
+                error = UURB_X11_ERROR_UNSUPPORTED;
+                break;
+            }
+            if (events[index].type == UURB_X11_INPUT_KEYBOARD &&
+                keycodes[index] == 0) {
+                error = UURB_X11_ERROR_UNSUPPORTED;
+                break;
+            }
+        }
+        if (error != 0) {
+            if (!send_response(client, request.sequence, 0, error))
+                break;
+            continue;
+        }
+
+        for (index = 0; index < request.count; index++) {
+            if (events[index].type == UURB_X11_INPUT_KEYBOARD) {
+                unsigned int keycode = keycodes[index];
+                bool is_release =
+                    (events[index].flags & UURB_KEYEVENTF_KEYUP) != 0;
+
+                if (is_release && pressed_keys[keycode] &&
+                    minimum_hold_ms > 0) {
+                    uint64_t now = monotonic_milliseconds();
+                    uint64_t elapsed = now - pressed_at[keycode];
+
+                    if (elapsed < minimum_hold_ms)
+                        sleep_milliseconds(minimum_hold_ms - elapsed);
+                }
+                if (!api->fake_key_event(injection_display, keycode,
+                                         is_release ? 0 : 1, 0)) {
+                    error = UURB_X11_ERROR_INJECTION;
+                    break;
+                }
+                pressed_keys[keycode] = !is_release;
+                if (!is_release)
+                    pressed_at[keycode] = monotonic_milliseconds();
+                else if (events[index].virtual_key == UURB_VK_BACK) {
+                    /* A long dictation revision can contain many Backspace
+                     * pairs. Flush each completed pair so full GNOME/VTE
+                     * clients cannot collapse or outrun the edit stream. */
+                    api->sync(injection_display, 0);
+                    sleep_milliseconds(UURB_BACKSPACE_SETTLE_MS);
+                }
+            } else if (!inject_mouse_event(api, injection_display,
+                                           &events[index],
+                                           pressed_buttons)) {
+                error = UURB_X11_ERROR_INJECTION;
+                break;
+            }
+            injected++;
+        }
+        api->sync(injection_display, 0);
+        if (!send_response(client, request.sequence,
+                           error == 0 ? request.count : injected, error))
+            break;
+    }
+    cancel_selection_transaction(&transaction);
+    release_pressed_inputs(api, injection_display, pressed_keys,
+                           pressed_buttons);
+}
+
+static void usage(const char *program)
+{
+    fprintf(stderr,
+            "usage: UURB_X11_INPUT_TOKEN=HEX64 %s --ready-file PATH "
+            "[--min-hold-ms 0..50] "
+            "[--inject-display DISPLAY --inject-xauthority PATH]\n",
+            program);
+}
+
+static Display *open_display_with_xauthority(const x11_api *api,
+                                             const char *display_name,
+                                             const char *xauthority)
+{
+    const char *current_xauthority = getenv("XAUTHORITY");
+    char *saved_xauthority = NULL;
+    Display *display;
+    bool restored;
+
+    if (current_xauthority) {
+        saved_xauthority = strdup(current_xauthority);
+        if (!saved_xauthority)
+            return NULL;
+    }
+    if (setenv("XAUTHORITY", xauthority, 1) != 0) {
+        free(saved_xauthority);
+        return NULL;
+    }
+    display = api->open_display(display_name);
+    if (saved_xauthority)
+        restored = setenv("XAUTHORITY", saved_xauthority, 1) == 0;
+    else
+        restored = unsetenv("XAUTHORITY") == 0;
+    free(saved_xauthority);
+    if (!restored && display) {
+        api->close_display(display);
+        display = NULL;
+    }
+    return display;
+}
+
+int main(int argc, char **argv)
+{
+    const char *ready_file = NULL;
+    const char *token = getenv("UURB_X11_INPUT_TOKEN");
+    const char *injection_display_name = NULL;
+    const char *injection_xauthority = NULL;
+    unsigned int minimum_hold_ms = 0;
+    struct sigaction action;
+    x11_api api;
+    Display *display;
+    Display *injection_display;
+    int index;
+    int status = EXIT_FAILURE;
+
+    for (index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "--ready-file") == 0 && index + 1 < argc) {
+            ready_file = argv[++index];
+        } else if (strcmp(argv[index], "--min-hold-ms") == 0 &&
+                   index + 1 < argc) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(argv[++index], &end, 10);
+
+            if (end == argv[index] || *end != '\0' || parsed > 50) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            minimum_hold_ms = (unsigned int)parsed;
+        } else if (strcmp(argv[index], "--inject-display") == 0 &&
+                   index + 1 < argc) {
+            injection_display_name = argv[++index];
+        } else if (strcmp(argv[index], "--inject-xauthority") == 0 &&
+                   index + 1 < argc) {
+            injection_xauthority = argv[++index];
+        } else {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (!ready_file || !valid_token(token) ||
+        ((injection_display_name == NULL) !=
+         (injection_xauthority == NULL)) ||
+        (injection_display_name && injection_display_name[0] == '\0') ||
+        (injection_xauthority &&
+         (injection_xauthority[0] != '/' ||
+          access(injection_xauthority, R_OK) != 0))) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (!load_x11_api(&api)) {
+        fprintf(stderr, "X11 XTEST runtime is unavailable.\n");
+        return EXIT_FAILURE;
+    }
+    display = api.open_display(NULL);
+    if (!display) {
+        fprintf(stderr, "Cannot open the selected X11 desktop.\n");
+        unload_x11_api(&api);
+        return EXIT_FAILURE;
+    }
+    injection_display = display;
+    if (injection_display_name) {
+        injection_display = open_display_with_xauthority(
+            &api, injection_display_name, injection_xauthority);
+        if (!injection_display) {
+            fprintf(stderr, "Cannot open the selected injection display.\n");
+            api.close_display(display);
+            unload_x11_api(&api);
+            return EXIT_FAILURE;
+        }
+    }
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    listener_fd = create_listener(ready_file);
+    if (listener_fd < 0) {
+        fprintf(stderr, "Cannot create the private X11 input listener.\n");
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "X11 input helper ready; minimum-hold-ms=%u clipboard-text=%s "
+            "injection-display=%s.\n",
+            minimum_hold_ms,
+            access("/usr/bin/xclip", X_OK) == 0 ? "available" : "unavailable",
+            injection_display_name ? injection_display_name : "same");
+
+    while (!stop_requested) {
+        int client;
+
+        if (!wait_input_ready((int)listener_fd))
+            break;
+        client = accept(listener_fd, NULL, NULL);
+
+        if (client < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            if (!stop_requested)
+                fprintf(stderr, "X11 input listener failed: %s\n",
+                        strerror(errno));
+            break;
+        }
+        active_client_fd = client;
+        serve_client(client, token, &api, display, injection_display,
+                     minimum_hold_ms);
+        active_client_fd = -1;
+        close(client);
+    }
+    status = stop_requested ? EXIT_SUCCESS : EXIT_FAILURE;
+
+cleanup:
+    stop_clipboard_owner();
+    if (listener_fd >= 0)
+        close(listener_fd);
+    unlink(ready_file);
+    if (injection_display != display)
+        api.close_display(injection_display);
+    api.close_display(display);
+    unload_x11_api(&api);
+    return status;
+}

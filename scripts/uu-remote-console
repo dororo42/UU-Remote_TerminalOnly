@@ -1,0 +1,1500 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+environment_file="$HOME/.config/uu-remote-bridge/environment"
+config_dir="$HOME/.config/uu-remote-bridge"
+bridge_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-bridge"
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-console"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-console"
+base_runtime_dir="$runtime_dir"
+base_state_dir="$state_dir"
+window_role=manager
+controller_window=""
+controller_pid=""
+controller_start=""
+controller_lobby=""
+controller_title=""
+window_watch_pid=""
+window_close_requested=false
+window_capture_fps=15
+window_desktop="UU Remote"
+# Keep cursor shapes at source size. A 48px resize cursor enlarged to 96px
+# exceeds LibVNCServer's update buffer and corrupts the manager's RFB stream.
+window_poll_options=(-scale_cursor 1)
+bridge_xauthority_file="$bridge_runtime_dir/Xauthority"
+bridge_display_file="$bridge_runtime_dir/private-display"
+bridge_focus_file="$bridge_runtime_dir/console-focus"
+window_lock_file="$runtime_dir/window.lock"
+window_session_file="$runtime_dir/window-session"
+script_path="$(readlink -f "$0")"
+systemctl_user=(
+    /usr/bin/env
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+    /usr/bin/systemctl --user
+)
+
+saved_setting() {
+    local name="$1"
+
+    [[ -f "$environment_file" ]] || return 0
+    /usr/bin/sed -n "s/^${name}=//p" "$environment_file" | \
+        /usr/bin/tail -n 1
+}
+
+saved_vnc_port="$(saved_setting UURB_CONSOLE_VNC_PORT)"
+saved_web_port="$(saved_setting UURB_CONSOLE_WEB_PORT)"
+saved_window_scale="$(saved_setting UURB_WINDOW_SCALE)"
+window_scale="${UURB_WINDOW_SCALE:-${saved_window_scale:-1}}"
+vnc_port="${UURB_CONSOLE_VNC_PORT:-${saved_vnc_port:-5920}}"
+web_port="${UURB_CONSOLE_WEB_PORT:-${saved_web_port:-6080}}"
+relay_vnc_port="${UURB_RELAY_VNC_PORT:-5922}"
+relay_vnc_auth_file="${UURB_RELAY_VNC_AUTH_FILE:-$config_dir/relay-vnc.pass}"
+novnc_root="${UURB_NOVNC_ROOT:-/usr/share/novnc}"
+console_url="http://127.0.0.1:$web_port/vnc.html?autoconnect=1&resize=scale&reconnect=1"
+bridge_display=""
+bridge_xauthority=""
+vnc_pid=""
+websockify_pid=""
+window_vnc_pid=""
+window_viewer_pid=""
+window_compositor_pid=""
+window_owner_start=""
+window_capture_ready_file=""
+window_capture_nonce=""
+relay_focus_pid=""
+
+notify_error() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send 'UU Remote' "$1"
+    fi
+    printf '%s\n' "$1" >&2
+}
+
+valid_port() {
+    [[ "$1" =~ ^[1-9][0-9]{3,4}$ ]] &&
+        ((10#$1 >= 1024 && 10#$1 <= 65535))
+}
+
+if [[ ! "$window_scale" =~ ^(1|1\.5|2|3)$ ]]; then
+    printf 'UU window scale must be 1, 1.5, 2, or 3.\n' >&2
+    exit 2
+fi
+if ! valid_port "$vnc_port" || ! valid_port "$web_port" ||
+   ! valid_port "$relay_vnc_port" ||
+   [[ "$vnc_port" == "$web_port" ||
+      "$vnc_port" == "$relay_vnc_port" ||
+      "$web_port" == "$relay_vnc_port" ]]; then
+    printf 'UU console ports must be distinct integers from 1024 through 65535.\n' \
+        >&2
+    exit 2
+fi
+vnc_port=$((10#$vnc_port))
+web_port=$((10#$web_port))
+relay_vnc_port=$((10#$relay_vnc_port))
+
+display_ready() {
+    local display="$1"
+    local xauthority="$2"
+
+    [[ "$display" =~ ^:(0|[1-9][0-9]{0,2})$ ]] &&
+        [[ -r "$xauthority" ]] &&
+        /usr/bin/env DISPLAY="$display" XAUTHORITY="$xauthority" \
+            /usr/bin/xdpyinfo >/dev/null 2>&1
+}
+
+discover_bridge() {
+    local -a arguments=()
+    local auth=""
+    local candidate=""
+    local index
+    local pid
+
+    bridge_display=""
+    bridge_xauthority=""
+    if [[ -r "$bridge_display_file" ]]; then
+        read -r candidate <"$bridge_display_file" || true
+        if display_ready "$candidate" "$bridge_xauthority_file"; then
+            bridge_display="$candidate"
+            bridge_xauthority="$bridge_xauthority_file"
+            return 0
+        fi
+    fi
+
+    while read -r pid; do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        arguments=()
+        if ! mapfile -d '' -t arguments <"/proc/$pid/cmdline"; then
+            continue
+        fi
+        candidate=""
+        auth=""
+        for ((index = 1; index < ${#arguments[@]}; index++)); do
+            if [[ "${arguments[index]}" =~ ^:(0|[1-9][0-9]{0,2})$ ]]; then
+                candidate="${arguments[index]}"
+            elif [[ "${arguments[index]}" == -auth &&
+                    $((index + 1)) -lt ${#arguments[@]} ]]; then
+                auth="${arguments[index + 1]}"
+                index=$((index + 1))
+            fi
+        done
+        if [[ "$auth" == "$bridge_xauthority_file" ]] &&
+           display_ready "$candidate" "$auth"; then
+            bridge_display="$candidate"
+            bridge_xauthority="$auth"
+            return 0
+        fi
+    done < <(/usr/bin/pgrep -u "$UID" -x Xvfb || true)
+    return 1
+}
+
+listener_present() {
+    /usr/bin/ss -H -ltn "sport = :$1" 2>/dev/null | \
+        /usr/bin/grep -q .
+}
+
+wait_for_bridge() {
+    for _ in {1..160}; do
+        if discover_bridge; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
+find_client_window() {
+    local name
+    local window
+    local managed_window=""
+    local unmapped_window=""
+    local properties
+    local geometry
+
+    discover_bridge || return 1
+    while read -r window; do
+        name="$(
+            /usr/bin/env DISPLAY="$bridge_display" \
+                XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xdotool getwindowname "$window" 2>/dev/null || true
+        )"
+        # Device names may themselves contain UU (for example UU Laptop).
+        # Only the application's known lobby titles identify the manager.
+        [[ "$name" == '网易UU远程' || "$name" == 'UU Remote' ]] || continue
+        properties="$(
+            /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xprop -id "$window" WM_STATE _NET_WM_WINDOW_TYPE 2>/dev/null || true
+        )"
+        # Prefer an existing managed window. Closing UU to its tray removes
+        # WM_STATE from the main window, so it needs a narrowly scoped fallback.
+        if /usr/bin/grep -q 'WM_STATE(WM_STATE)' <<<"$properties"; then
+            managed_window="$window"
+            continue
+        fi
+        [[ -z "$unmapped_window" ]] || continue
+        /usr/bin/grep -q '_NET_WM_WINDOW_TYPE_NORMAL' <<<"$properties" || continue
+        geometry="$(
+            /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xwininfo -id "$window" 2>/dev/null || true
+        )"
+        # Hidden toasts share UU's title, class and NORMAL type. Only map a
+        # full-sized, non-override main window; never a transient notification.
+        if /usr/bin/awk '
+            $1 == "Width:" { width = $2 }
+            $1 == "Height:" { height = $2 }
+            $1 == "Map" && $2 == "State:" { unmapped = ($3 == "IsUnMapped") }
+            $1 == "Override" && $2 == "Redirect" { normal = ($4 == "no") }
+            END { exit !(width >= 640 && height >= 360 && unmapped && normal) }
+        ' <<<"$geometry"; then
+            unmapped_window="$window"
+        fi
+    done < <(
+        /usr/bin/env DISPLAY="$bridge_display" \
+            XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool search --class 'gameviewer.exe' 2>/dev/null ||
+            true
+    )
+    if [[ -n "$managed_window" ]]; then
+        printf '%s\n' "$managed_window"
+    elif [[ -n "$unmapped_window" ]]; then
+        printf '%s\n' "$unmapped_window"
+    fi
+}
+
+find_relay_window() {
+    local relay=""
+    discover_bridge || return 1
+    relay="$(
+        /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool search --onlyvisible \
+                --name '^Ubuntu-Desktop-Relay$' 2>/dev/null | \
+            /usr/bin/tail -n 1 || true
+    )"
+    if [[ -z "$relay" ]]; then
+        relay="$(
+            /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xdotool search --onlyvisible --all \
+                    --class 'realvnc-vncviewer' \
+                    --name '^127\.0\.0\.1:.* - RealVNC Viewer$' 2>/dev/null | \
+                /usr/bin/tail -n 1 || true
+        )"
+    fi
+    [[ -n "$relay" ]] || return 1
+    printf '%s\n' "$relay"
+}
+
+resume_private_client() {
+    local client_window=""
+    local saved_prefix=""
+    local prefix=""
+    local executable=""
+
+    discover_bridge || return 1
+    client_window="$(find_client_window | /usr/bin/tail -n 1)"
+    [[ -n "$client_window" ]] || return 0
+    if ! /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/xwininfo -id "$client_window" 2>/dev/null | \
+        /usr/bin/grep -q 'Map State: IsUnMapped'; then
+        return 0
+    fi
+    saved_prefix="$(saved_setting UURB_WINEPREFIX)"
+    prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-${saved_prefix:-$HOME/.local/share/wineprefixes/uu-remote}}}"
+    executable="$prefix/drive_c/Program Files/Netease/GameViewer/GameViewer.exe"
+    [[ -f "$executable" ]] || return 1
+    /usr/bin/install -d -m 0700 "$state_dir"
+    # XMapWindow alone leaves Qt's hidden application backing store black.
+    # UU's single-instance launcher tells the existing GUI to resume painting.
+    # Close the viewer lock in the child so Wine cannot retain the session lock.
+    /usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 \
+        DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        WINEPREFIX="$prefix" WINEDEBUG=-all LIBGL_ALWAYS_SOFTWARE=1 \
+        /usr/bin/timeout --kill-after=2s 10s \
+        /opt/wine-stable/bin/wine start /unix "$executable" \
+        </dev/null >>"$state_dir/client-resume.log" 2>&1 9>&-
+}
+
+activate_private_client() {
+    local client_window=""
+
+    discover_bridge || return 1
+    resume_private_client || return 1
+    client_window="$(find_client_window | /usr/bin/tail -n 1)"
+    if [[ -n "$client_window" ]]; then
+        /usr/bin/env DISPLAY="$bridge_display" \
+            XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool windowmap "$client_window" \
+                windowactivate --sync "$client_window" >/dev/null 2>&1 || true
+    fi
+}
+
+focus_client() {
+    discover_bridge || return 1
+    /usr/bin/install -d -m 0700 "$bridge_runtime_dir"
+    printf '%s\n' "$$" >"$bridge_focus_file"
+    chmod 0600 "$bridge_focus_file"
+    activate_private_client
+}
+
+release_client() {
+    local client_window=""
+    local relay_window=""
+
+    rm -f "$bridge_focus_file"
+    discover_bridge || return 0
+    # The UU client must stay mapped: minimizing it while its layered
+    # top-level windows are being replaced raises BadWindow, terminates the
+    # GUI IPC client, and makes the server destroy its room. Activating the
+    # relay window instead pushes the client safely behind the desktop.
+    relay_window="$(find_relay_window || true)"
+    if [[ -n "$relay_window" ]]; then
+        /usr/bin/env DISPLAY="$bridge_display" \
+            XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool windowactivate "$relay_window" \
+                >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup_server() {
+    local pid
+
+    trap - EXIT INT TERM HUP
+    for pid in "$websockify_pid" "$vnc_pid"; do
+        if [[ -n "$pid" ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+    release_client || true
+    rm -f "$runtime_dir/url" "$runtime_dir/display"
+}
+
+process_start_time() {
+    local pid="$1"
+    local status
+    local -a fields=()
+
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" ]] || return 1
+    status="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    read -r -a fields <<<"${status##*) }"
+    [[ "${fields[0]:-Z}" != Z && "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+window_process_matches() {
+    local pid="$1" start="$2" name="${3:-}"
+
+    [[ -n "$start" && "$(process_start_time "$pid" || true)" == "$start" ]] || return 1
+    [[ -z "$name" || "$(cat "/proc/$pid/comm" 2>/dev/null)" == "$name" ]]
+}
+
+save_window_session() {
+    local temporary
+
+    temporary="$(mktemp "$window_session_file.XXXXXX")"
+    printf '%s\n' "$$" "$window_owner_start" "$bridge_display" "$bridge_xauthority" \
+        "$window_compositor_pid" "$(process_start_time "$window_compositor_pid" || true)" \
+        "$window_vnc_pid" "$(process_start_time "$window_vnc_pid" || true)" \
+        "$window_viewer_pid" "$(process_start_time "$window_viewer_pid" || true)" >"$temporary"
+    mv "$temporary" "$window_session_file"
+}
+
+cleanup_orphaned_window() {
+    local -a session=()
+    local index name pid
+
+    [[ -r "$window_session_file" ]] || return 0
+    mapfile -t session <"$window_session_file"
+    ((${#session[@]} == 10)) || return 0
+    window_process_matches "${session[0]}" "${session[1]}" && return 1
+    window_process_matches "${session[8]}" "${session[9]}" vncviewer && return 1
+    [[ "${session[2]}" == "$bridge_display" && "${session[3]}" == "$bridge_xauthority" ]] || return 0
+    for index in 4 6; do
+        name=xcompmgr
+        ((index == 4)) || name=x11vnc
+        pid="${session[index]}"
+        if window_process_matches "$pid" "${session[index + 1]}" "$name" &&
+           /usr/bin/grep -zFxq "DISPLAY=$bridge_display" "/proc/$pid/environ" 2>/dev/null &&
+           /usr/bin/grep -zFxq "XAUTHORITY=$bridge_xauthority" "/proc/$pid/environ" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+            for _ in {1..20}; do
+                window_process_matches "$pid" "${session[index + 1]}" "$name" || break
+                sleep 0.01
+            done
+        fi
+    done
+    rm -f "$window_session_file"
+}
+
+window_pid() {
+    /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/xprop -id "$1" _NET_WM_PID 2>/dev/null | \
+        /usr/bin/awk '$1 == "_NET_WM_PID(CARDINAL)" && $3 ~ /^[1-9][0-9]*$/ { print $3 }'
+}
+
+controller_window_matches() {
+    local window="$1" pid="$2" start="$3" lobby="$4" hidden="${5:-false}"
+    local name properties geometry
+    [[ "$window" =~ ^[1-9][0-9]*$ && "$pid" =~ ^[1-9][0-9]*$ &&
+       "$lobby" =~ ^[1-9][0-9]*$ && "$window" != "$lobby" &&
+       "$(process_start_time "$pid" || true)" == "$start" && -n "$start" ]] || return 1
+    [[ "$(window_pid "$window")" == "$pid" && "$(window_pid "$lobby")" == "$pid" ]] || return 1
+    name="$(/usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/xdotool getwindowname "$window" 2>/dev/null || true)"
+    [[ -n "$name" && "$name" != '网易UU远程' && "$name" != 'UU Remote' && "$name" != 'GameViewer' ]] || return 1
+    properties="$(/usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/xprop -id "$window" WM_CLASS _NET_WM_WINDOW_TYPE WM_TRANSIENT_FOR 2>/dev/null || true)"
+    /usr/bin/grep -qi 'WM_CLASS.*"gameviewer.exe"' <<<"$properties" || return 1
+    /usr/bin/grep -q '_NET_WM_WINDOW_TYPE_NORMAL' <<<"$properties" || return 1
+    /usr/bin/grep -q 'WM_TRANSIENT_FOR.*not found' <<<"$properties" || return 1
+    geometry="$(/usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/xwininfo -id "$window" 2>/dev/null || true)"
+    /usr/bin/awk -v hidden="$hidden" '
+        $1 == "Width:" { width = $2 }
+        $1 == "Height:" { height = $2 }
+        $1 == "Map" && $2 == "State:" { visible = ($3 == "IsViewable") }
+        $1 == "Override" && $2 == "Redirect" { normal = ($4 == "no") }
+        END { exit !(width >= 640 && height >= 360 && normal && (visible || hidden == "true")) }
+    ' <<<"$geometry"
+}
+
+close_controller_window() {
+    [[ "$window_role" == controller ]] || return 0
+    controller_window_matches "$controller_window" "$controller_pid" "$controller_start" \
+        "$controller_lobby" true || return 0
+    # Ask Openbox to deliver WM_DELETE_WINDOW. XDestroyWindow/windowclose is
+    # unsafe for this Wine process and must never be used as a fallback.
+    /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/python3 - "$controller_window" "$controller_pid" "$controller_title" <<'PY_CLOSE'
+import ctypes as C
+import sys
+class Hint(C.Structure):
+    _fields_ = [("name", C.c_void_p), ("klass", C.c_void_p)]
+class Data(C.Union):
+    _fields_ = [("bytes", C.c_char * 20), ("shorts", C.c_short * 10), ("longs", C.c_long * 5)]
+class Message(C.Structure):
+    _fields_ = [("type", C.c_int), ("serial", C.c_ulong), ("sent", C.c_int),
+                ("display", C.c_void_p), ("window", C.c_ulong), ("message", C.c_ulong),
+                ("format", C.c_int), ("data", Data)]
+class Event(C.Union):
+    _fields_ = [("message", Message), ("padding", C.c_long * 24)]
+lib = C.CDLL("libX11.so.6")
+for name, result, args in [
+    ("XOpenDisplay", C.c_void_p, [C.c_char_p]),
+    ("XCloseDisplay", C.c_int, [C.c_void_p]),
+    ("XDefaultRootWindow", C.c_ulong, [C.c_void_p]),
+    ("XInternAtom", C.c_ulong, [C.c_void_p, C.c_char_p, C.c_int]),
+    ("XGetWindowProperty", C.c_int, [C.c_void_p, C.c_ulong, C.c_ulong, C.c_long, C.c_long,
+        C.c_int, C.c_ulong, C.POINTER(C.c_ulong), C.POINTER(C.c_int),
+        C.POINTER(C.c_ulong), C.POINTER(C.c_ulong), C.POINTER(C.c_void_p)]),
+    ("XGetClassHint", C.c_int, [C.c_void_p, C.c_ulong, C.POINTER(Hint)]),
+    ("XFetchName", C.c_int, [C.c_void_p, C.c_ulong, C.POINTER(C.c_void_p)]),
+    ("XFree", C.c_int, [C.c_void_p]),
+    ("XSendEvent", C.c_int, [C.c_void_p, C.c_ulong, C.c_int, C.c_long, C.POINTER(Event)]),
+    ("XSync", C.c_int, [C.c_void_p, C.c_int]),
+    ("XGrabServer", C.c_int, [C.c_void_p]), ("XUngrabServer", C.c_int, [C.c_void_p]),
+]:
+    function = getattr(lib, name); function.restype = result; function.argtypes = args
+window, expected_pid = int(sys.argv[1]), int(sys.argv[2])
+display = lib.XOpenDisplay(None)
+if not display:
+    raise SystemExit(1)
+def atom(name):
+    return lib.XInternAtom(display, name.encode(), 0)
+def property_values(name, expected_type):
+    actual, count, remaining, fmt, raw = C.c_ulong(), C.c_ulong(), C.c_ulong(), C.c_int(), C.c_void_p()
+    status = lib.XGetWindowProperty(display, window, atom(name), 0, 32, 0, expected_type,
+        C.byref(actual), C.byref(fmt), C.byref(count), C.byref(remaining), C.byref(raw))
+    values = []
+    if status == 0 and actual.value == expected_type and fmt.value == 32 and raw.value:
+        values = list(C.cast(raw, C.POINTER(C.c_ulong))[:count.value])
+    if raw.value:
+        lib.XFree(raw)
+    return values
+def window_title():
+    actual, count, remaining, fmt, raw = C.c_ulong(), C.c_ulong(), C.c_ulong(), C.c_int(), C.c_void_p()
+    utf8 = atom("UTF8_STRING")
+    status = lib.XGetWindowProperty(display, window, atom("_NET_WM_NAME"), 0, 256, 0, utf8,
+        C.byref(actual), C.byref(fmt), C.byref(count), C.byref(remaining), C.byref(raw))
+    try:
+        if status != 0:
+            return None
+        if actual.value:
+            if actual.value != utf8 or fmt.value != 8 or count.value >= 1024 or remaining.value or not raw.value:
+                return None
+            value = C.string_at(raw, count.value)
+            if b"\0" in value:
+                return None
+            return value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    finally:
+        if raw.value:
+            lib.XFree(raw)
+    # Bound the legacy property before XFetchName; retain the original ASCII
+    # close path only when the UTF8 property is genuinely absent.
+    status = lib.XGetWindowProperty(display, window, atom("WM_NAME"), 0, 256, 0, 31,
+        C.byref(actual), C.byref(fmt), C.byref(count), C.byref(remaining), C.byref(raw))
+    try:
+        if status != 0 or actual.value != 31 or fmt.value != 8 or count.value >= 1024 or remaining.value or not raw.value:
+            return None
+        if b"\0" in C.string_at(raw, count.value):
+            return None
+    finally:
+        if raw.value:
+            lib.XFree(raw)
+    title = C.c_void_p()
+    try:
+        if lib.XFetchName(display, window, C.byref(title)) and title.value:
+            return C.string_at(title).decode(errors="replace")
+        return None
+    finally:
+        if title.value:
+            lib.XFree(title)
+lib.XGrabServer(display)
+try:
+    hint = Hint()
+    valid = property_values("_NET_WM_PID", 6) == [expected_pid]
+    valid = valid and lib.XGetClassHint(display, window, C.byref(hint)) != 0
+    valid = valid and any(value and C.string_at(value).lower() == b"gameviewer.exe" for value in (hint.name, hint.klass))
+    for value in (hint.name, hint.klass):
+        if value:
+            lib.XFree(value)
+    valid = valid and window_title() == sys.argv[3]
+    valid = valid and atom("WM_DELETE_WINDOW") in property_values("WM_PROTOCOLS", 4)
+    if not valid:
+        raise SystemExit(1)
+    event = Event()
+    event.message.type, event.message.sent = 33, 1
+    event.message.display, event.message.window = display, window
+    event.message.message, event.message.format = atom("_NET_CLOSE_WINDOW"), 32
+    event.message.data.longs[0], event.message.data.longs[1] = 0, 2
+    if not lib.XSendEvent(display, lib.XDefaultRootWindow(display), 0,
+            (1 << 19) | (1 << 20), C.byref(event)):
+        raise SystemExit(1)
+finally:
+    lib.XUngrabServer(display)
+    lib.XSync(display, 0)
+    lib.XCloseDisplay(display)
+PY_CLOSE
+    local status=$?
+    ((status == 0)) || return "$status"
+    for _ in {1..30}; do
+        [[ "$(window_pid "$controller_window")" == "$controller_pid" ]] || return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+controller_session_running() {
+    local -a session=()
+    local file="$base_runtime_dir/controller.$1/window-session"
+    [[ -r "$file" && ! -L "$file" ]] || return 1
+    mapfile -t session <"$file"
+    ((${#session[@]} == 10)) || return 1
+    [[ "${session[2]}" == "$bridge_display" && "${session[3]}" == "$bridge_xauthority" ]] || return 1
+    window_process_matches "${session[0]}" "${session[1]}" ||
+        window_process_matches "${session[8]}" "${session[9]}" vncviewer
+}
+
+fit_private_controller() {
+    local helper="$1"
+    shift
+    controller_window_matches "$controller_window" "$controller_pid" \
+        "$controller_start" "$controller_lobby" || return 1
+    /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        /usr/bin/timeout --signal=TERM --kill-after=1s 3s /usr/bin/python3 "$helper" \
+        "$controller_window" "$controller_pid" "$controller_start" "$@" \
+        </dev/null 2>>"$state_dir/controller-fit.log" 9>&- 7>&- |
+        /usr/bin/python3 -c 'import json,sys; v=json.load(sys.stdin); print(*v["root"], *v["geometry"], *v["preferred"])'
+}
+
+watch_controller_windows() {
+    local owner="$1" owner_start="$2" lobby="$3" pid="$4" start="$5" window child active
+    local -A launched=() child_starts=() retry_after=()
+    trap 'exit 0' TERM INT HUP
+    while window_process_matches "$owner" "$owner_start"; do
+        active=0
+        for window in "${!launched[@]}"; do
+            if window_process_matches "${launched[$window]}" "${child_starts[$window]}"; then
+                active=$((active + 1))
+            else
+                unset 'launched[$window]' 'child_starts[$window]'
+            fi
+        done
+        while read -r window; do
+            [[ "$window" =~ ^[1-9][0-9]*$ ]] || continue
+            [[ -z "${launched[$window]:-}" && "$active" -lt 4 ]] || continue
+            ((SECONDS >= ${retry_after[$window]:-0})) || continue
+            controller_window_matches "$window" "$pid" "$start" "$lobby" || continue
+            if controller_session_running "$window"; then
+                active=$((active + 1))
+                continue
+            fi
+            "$script_path" controller-window "$window" "$pid" "$start" "$lobby" \
+                </dev/null >>"$base_state_dir/controller-launch.log" 2>&1 9>&- 7>&- &
+            child=$!
+            launched[$window]="$child"
+            child_starts[$window]="$(process_start_time "$child" || true)"
+            retry_after[$window]=$((SECONDS + 5))
+            active=$((active + 1))
+        done < <(/usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool search --onlyvisible --class gameviewer.exe 2>/dev/null || true)
+        sleep 0.5
+    done
+}
+
+manager_capture_ready() {
+    local ready_nonce="" ready_pid="" ready_window="" ready_display="" extra=""
+
+    [[ -f "$window_capture_ready_file" && ! -L "$window_capture_ready_file" &&
+       -r "$window_capture_ready_file" ]] || return 1
+    {
+        IFS=' ' read -r -n 256 ready_nonce ready_pid ready_window ready_display extra &&
+        [[ -z "$extra" ]] &&
+        ! IFS= read -r -n 1 extra && [[ -z "$extra" ]]
+    } <"$window_capture_ready_file" || return 1
+    [[ "$ready_nonce" == "$window_capture_nonce" &&
+       "$ready_pid" == "$window_vnc_pid" &&
+       "$ready_window" == "$client_window" &&
+       "$ready_display" == "$bridge_display" ]]
+}
+
+cleanup_window() {
+    local -a session=()
+    trap - EXIT INT TERM HUP
+    if [[ -n "$window_watch_pid" ]]; then
+        kill "$window_watch_pid" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+            kill -0 "$window_watch_pid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        kill -KILL "$window_watch_pid" >/dev/null 2>&1 || true
+        wait "$window_watch_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$window_viewer_pid" ]]; then
+        kill "$window_viewer_pid" >/dev/null 2>&1 || true
+        wait "$window_viewer_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$window_vnc_pid" ]]; then
+        kill "$window_vnc_pid" >/dev/null 2>&1 || true
+        # x11vnc -forever can hang on TERM; bound the wait and force-kill,
+        # otherwise the console blocks in wait and holds the window lock.
+        for _ in {1..20}; do
+            kill -0 "$window_vnc_pid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        kill -KILL "$window_vnc_pid" >/dev/null 2>&1 || true
+        wait "$window_vnc_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$window_compositor_pid" ]]; then
+        kill "$window_compositor_pid" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+            kill -0 "$window_compositor_pid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        kill -KILL "$window_compositor_pid" >/dev/null 2>&1 || true
+        wait "$window_compositor_pid" 2>/dev/null || true
+    fi
+    if [[ "$window_role" == controller ]]; then
+        if [[ "$window_close_requested" == true ]] && ! close_controller_window; then
+            notify_error 'UU did not acknowledge this controller window close. End that session in UU.'
+        fi
+        restore_private_focus || true
+    else
+        release_client || true
+    fi
+    rm -f "$runtime_dir/window.port"
+    if [[ -n "$window_capture_ready_file" ]]; then
+        rm -f "$window_capture_ready_file"
+    fi
+    if [[ -r "$window_session_file" ]]; then
+        mapfile -t session <"$window_session_file"
+        if [[ "${session[0]:-}" == "$$" && "${session[1]:-}" == "$window_owner_start" ]]; then
+            rm -f "$window_session_file"
+        fi
+    fi
+}
+
+restore_private_focus() {
+    local client_window=""
+    local relay_window=""
+
+    if [[ -e "$bridge_focus_file" ]]; then
+        client_window="$(find_client_window | /usr/bin/tail -n 1)"
+        if [[ -n "$client_window" ]]; then
+            /usr/bin/env DISPLAY="$bridge_display" \
+                XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xdotool windowactivate "$client_window" \
+                    >/dev/null 2>&1 || true
+            return 0
+        fi
+    fi
+    relay_window="$(find_relay_window)"
+    if [[ -n "$relay_window" ]]; then
+        /usr/bin/env DISPLAY="$bridge_display" \
+            XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool windowactivate "$relay_window" \
+                >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup_relay_vnc() {
+    trap - EXIT INT TERM HUP
+    if [[ -n "$relay_focus_pid" ]]; then
+        kill "$relay_focus_pid" >/dev/null 2>&1 || true
+        wait "$relay_focus_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$vnc_pid" ]]; then
+        kill "$vnc_pid" >/dev/null 2>&1 || true
+        wait "$vnc_pid" 2>/dev/null || true
+    fi
+    restore_private_focus || true
+}
+
+prepare_relay_vnc_auth() {
+    local password=""
+    local quoted_temporary=""
+    local temporary=""
+    local vnc_password=""
+
+    if [[ -s "$relay_vnc_auth_file" ]]; then
+        chmod 0600 "$relay_vnc_auth_file"
+        return 0
+    fi
+    if [[ ! -x /usr/bin/secret-tool ]]; then
+        printf 'The relay VNC credential is missing and secret-tool is unavailable.\n' \
+            >&2
+        return 1
+    fi
+    password="$(
+        /usr/bin/secret-tool lookup service uu-desktop-bridge \
+            username "$USER" 2>/dev/null || true
+    )"
+    if [[ -z "$password" ]]; then
+        printf 'The relay VNC credential could not be recovered from the keyring.\n' \
+            >&2
+        return 1
+    fi
+
+    /usr/bin/install -d -m 0700 "$config_dir"
+    temporary="$(/usr/bin/mktemp "$config_dir/relay-vnc.pass.XXXXXX")"
+    # Classic VNC authentication consumes at most eight password bytes.
+    # Truncate explicitly so x11vnc does not reject a longer RDP credential
+    # and desynchronize its interactive confirmation prompts.
+    vnc_password="$(LC_ALL=C printf '%.8s' "$password")"
+    printf -v quoted_temporary '%q' "$temporary"
+    if ! printf '%s\n%s\ny\n' "$vnc_password" "$vnc_password" |
+        /usr/bin/script -qefc \
+            "/usr/bin/x11vnc -storepasswd $quoted_temporary" /dev/null \
+            >/dev/null 2>&1; then
+        rm -f "$temporary"
+        unset password vnc_password
+        printf 'The relay VNC credential could not be generated.\n' >&2
+        return 1
+    fi
+    unset password vnc_password
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$relay_vnc_auth_file"
+}
+
+takeover_stuck_window() {
+    local -a sidecar_pids=() session=()
+    local stuck_pid stuck_start="" pid index name
+
+    if [[ -r "$bridge_focus_file" ]]; then
+        stuck_pid="$(cat "$bridge_focus_file" 2>/dev/null || true)"
+    else
+        # Isolated managers have no focus lease; retain exact session identity.
+        [[ -r "$window_session_file" ]] || return 1
+        mapfile -t session <"$window_session_file"
+        ((${#session[@]} == 10)) || return 1
+        [[ "${session[2]}" == "$bridge_display" && "${session[3]}" == "$bridge_xauthority" ]] || return 1
+        stuck_pid="${session[0]}"
+        stuck_start="${session[1]}"
+        window_process_matches "$stuck_pid" "$stuck_start" || return 1
+        window_process_matches "${session[8]}" "${session[9]}" vncviewer && return 1
+    fi
+    [[ "$stuck_pid" =~ ^[0-9]+$ && "$stuck_pid" != "$$" ]] || return 1
+    kill -0 "$stuck_pid" >/dev/null 2>&1 || return 1
+    /usr/bin/grep -aq "uu-remote-console" "/proc/$stuck_pid/cmdline" \
+        2>/dev/null || return 1
+    # A console still serving a live viewer must never be taken over.
+    if /usr/bin/pgrep -P "$stuck_pid" -x vncviewer >/dev/null 2>&1; then
+        return 1
+    fi
+    # Only a console whose viewer died but whose x11vnc sidecar still runs
+    # is genuinely stuck in cleanup and safe to replace.
+    /usr/bin/pgrep -P "$stuck_pid" -x x11vnc >/dev/null 2>&1 || return 1
+    # Record owned sidecars before their parent dies and they are reparented.
+    mapfile -t sidecar_pids < <(
+        /usr/bin/pgrep -P "$stuck_pid" -x 'x11vnc|xcompmgr' || true
+    )
+    if [[ -n "$stuck_start" ]]; then
+        for pid in "${sidecar_pids[@]}"; do
+            index=4 name=xcompmgr
+            if [[ "$pid" == "${session[6]}" ]]; then
+                index=6 name=x11vnc
+            fi
+            [[ "$pid" == "${session[index]}" ]] || return 1
+            window_process_matches "$pid" "${session[index + 1]}" "$name" || return 1
+            /usr/bin/grep -zFxq "DISPLAY=$bridge_display" "/proc/$pid/environ" 2>/dev/null || return 1
+            /usr/bin/grep -zFxq "XAUTHORITY=$bridge_xauthority" "/proc/$pid/environ" 2>/dev/null || return 1
+        done
+        window_process_matches "$stuck_pid" "$stuck_start" || return 1
+    fi
+    kill -KILL "$stuck_pid" >/dev/null 2>&1 || true
+    if ((${#sidecar_pids[@]} > 0)); then
+        kill -KILL "${sidecar_pids[@]}" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+    return 0
+}
+
+activate_existing_window() {
+    local window=""
+    local -a session=()
+
+    [[ -n "${DISPLAY:-}" ]] || return 1
+    if [[ "$window_role" == controller ]]; then
+        [[ -r "$window_session_file" ]] || return 1
+        mapfile -t session <"$window_session_file"
+        ((${#session[@]} == 10)) || return 1
+        window_process_matches "${session[8]}" "${session[9]}" vncviewer || return 1
+        window="$(/usr/bin/xdotool search --pid "${session[8]}" \
+            --class 'TigerVNC Viewer' 2>/dev/null | /usr/bin/tail -n 1 || true)"
+        [[ -n "$window" ]] || return 1
+        /usr/bin/xdotool windowactivate --sync "$window" >/dev/null 2>&1
+        return
+    fi
+    while read -r candidate; do
+        if [[ "$(
+            /usr/bin/xdotool getwindowname "$candidate" 2>/dev/null || true
+        )" == 'UU Remote - TigerVNC' ]]; then
+            window="$candidate"
+        fi
+    done < <(
+        /usr/bin/xdotool search --class 'TigerVNC Viewer' 2>/dev/null || true
+    )
+    [[ -n "$window" ]] || return 1
+    # Existing leased sessions keep their original behavior. An isolated
+    # manager must not refocus the private client when its viewer reopens.
+    if [[ -e "$bridge_focus_file" ]]; then
+        activate_private_client || return 1
+    else
+        release_client || return 1
+    fi
+    /usr/bin/xdotool windowactivate --sync "$window" >/dev/null 2>&1
+}
+
+choose_window_port() {
+    local candidate=$((vnc_port + 1))
+
+    for _ in {1..64}; do
+        if ((candidate > 65535)); then
+            candidate=5900
+        fi
+        if [[ "$candidate" != "$web_port" ]] &&
+           ! listener_present "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        candidate=$((candidate + 1))
+    done
+    return 1
+}
+
+ensure_bridge() {
+    local bridge_process=false
+
+    if discover_bridge; then
+        return 0
+    fi
+    if /usr/bin/pgrep -u "$UID" -f \
+        '(^|/)uu-remote-bridge($|[[:space:]])' >/dev/null; then
+        bridge_process=true
+    fi
+    if [[ "$bridge_process" == false ]]; then
+        "${systemctl_user[@]}" start uu-remote-bridge.service || return 1
+    fi
+    wait_for_bridge
+}
+
+serve_relay_vnc() {
+    local connected=false
+    local connected_checks=0
+    local idle_checks=0
+    local relay_window=""
+    local ready=false
+
+    for command in /usr/bin/script /usr/bin/ss /usr/bin/x11vnc \
+        /usr/bin/xdotool /usr/bin/xdpyinfo; do
+        if [[ ! -x "$command" ]]; then
+            printf 'UU relay VNC dependency is missing: %s\n' "$command" >&2
+            return 1
+        fi
+    done
+    if ! ensure_bridge; then
+        printf 'The Ubuntu desktop bridge could not start.\n' >&2
+        return 1
+    fi
+    if ! prepare_relay_vnc_auth; then
+        return 1
+    fi
+    if listener_present "$relay_vnc_port"; then
+        printf 'UU relay VNC port %s is already in use.\n' \
+            "$relay_vnc_port" >&2
+        return 1
+    fi
+    relay_window="$(find_relay_window)"
+    if [[ -z "$relay_window" ]]; then
+        printf 'The Ubuntu desktop relay window is unavailable.\n' >&2
+        return 1
+    fi
+
+    /usr/bin/install -d -m 0700 "$state_dir"
+    trap cleanup_relay_vnc EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    /usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 \
+        /usr/bin/x11vnc \
+        -display "$bridge_display" \
+        -auth "$bridge_xauthority" \
+        -id "$relay_window" \
+        -rfbport "$relay_vnc_port" \
+        -listen 127.0.0.1 \
+        -localhost \
+        -no6 \
+        -rfbauth "$relay_vnc_auth_file" \
+        -forever \
+        -shared \
+        -noxdamage \
+        -nowf \
+        -noscr \
+        -desktop 'Ubuntu Physical Desktop' \
+        -quiet \
+        >>"$state_dir/relay-x11vnc.log" 2>&1 &
+    vnc_pid=$!
+
+    for _ in {1..80}; do
+        if listener_present "$relay_vnc_port" &&
+           kill -0 "$vnc_pid" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        kill -0 "$vnc_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        printf 'The Ubuntu desktop relay VNC listener did not start.\n' >&2
+        return 1
+    fi
+
+    for _ in {1..300}; do
+        if /usr/bin/ss -H -tn state established \
+            "sport = :$relay_vnc_port" 2>/dev/null |
+            /usr/bin/grep -q .; then
+            connected_checks=$((connected_checks + 1))
+            if ((connected_checks >= 3)); then
+                connected=true
+                break
+            fi
+        else
+            connected_checks=0
+        fi
+        kill -0 "$vnc_pid" >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+    if [[ "$connected" != true ]]; then
+        printf 'No relay VNC viewer connected within 60 seconds.\n' >&2
+        return 1
+    fi
+
+    (
+        while kill -0 "$vnc_pid" >/dev/null 2>&1; do
+            /usr/bin/env DISPLAY="$bridge_display" \
+                XAUTHORITY="$bridge_xauthority" \
+                /usr/bin/xdotool windowactivate "$relay_window" \
+                    >/dev/null 2>&1 || true
+            sleep 0.25
+        done
+    ) &
+    relay_focus_pid=$!
+
+    while kill -0 "$vnc_pid" >/dev/null 2>&1; do
+        if /usr/bin/ss -H -tn state established \
+            "sport = :$relay_vnc_port" 2>/dev/null |
+            /usr/bin/grep -q .; then
+            idle_checks=0
+        else
+            idle_checks=$((idle_checks + 1))
+            if ((idle_checks >= 25)); then
+                break
+            fi
+        fi
+        sleep 0.2
+    done
+}
+
+open_window() {
+    local client_window=""
+    local command
+    local ready=false
+    local viewer_status=0
+    local window_port=""
+    local saved_prefix=""
+    local prefix=""
+    local manager_capture=""
+    local controller_fit_helper=""
+    local controller_fit_state=""
+    local manual_route="${UURB_INPUT_ROUTE:-$(saved_setting UURB_INPUT_ROUTE)}"
+    local manual_plane_helper="$HOME/.local/share/uu-remote/tools/uu-manual-plane.py"
+    local bridge_main_pid=""
+    local isolate_manager_root=0
+
+    if [[ -z "${DISPLAY:-}" ]]; then
+        notify_error 'Open UU Remote from a logged-in graphical desktop.'
+        return 1
+    fi
+    for command in /usr/bin/flock /usr/bin/ss /usr/bin/vncviewer \
+        /usr/bin/x11vnc /usr/bin/xcompmgr /usr/bin/xdotool /usr/bin/xdpyinfo; do
+        if [[ ! -x "$command" ]]; then
+            notify_error "UU window dependency is missing: $command"
+            return 1
+        fi
+    done
+
+    /usr/bin/install -d -m 0700 "$runtime_dir" "$state_dir"
+    exec 9>"$window_lock_file"
+    if ! /usr/bin/flock -n 9; then
+        if activate_existing_window; then
+            return 0
+        fi
+        if [[ "$window_role" == controller ]]; then
+            notify_error 'This outgoing UU controller window is already starting.'
+            return 1
+        fi
+        if ! takeover_stuck_window || ! /usr/bin/flock -n 9; then
+            notify_error 'The UU Remote window is already starting.'
+            return 1
+        fi
+    fi
+    saved_prefix="$(saved_setting UURB_WINEPREFIX)"
+    prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-${saved_prefix:-$HOME/.local/share/wineprefixes/uu-remote}}}"
+    manager_capture="$prefix/compat/uu-manager-capture.so"
+    if [[ ! -f "$manager_capture" || ! -r "$manager_capture" ]]; then
+        notify_error "The UU manager capture module is missing: $manager_capture. Reinstall the bridge."
+        return 1
+    fi
+    if [[ "$window_role" == controller ]]; then
+        if ! discover_bridge || ! controller_window_matches "$controller_window" \
+            "$controller_pid" "$controller_start" "$controller_lobby"; then
+            notify_error 'The outgoing UU controller window is no longer available.'
+            return 1
+        fi
+        controller_fit_helper="$prefix/compat/uu-controller-fit.py"
+        if [[ ! -f "$controller_fit_helper" || ! -r "$controller_fit_helper" ]] ||
+           ! controller_fit_state="$(fit_private_controller "$controller_fit_helper")"; then
+            notify_error 'The outgoing controller could not fit its private screen; its session was preserved.'
+            return 1
+        fi
+        controller_title="$(/usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+            /usr/bin/xdotool getwindowname "$controller_window")"
+        window_desktop="$controller_title - UU controller"
+    elif ! ensure_bridge; then
+        notify_error 'The Ubuntu desktop bridge could not start.'
+        return 1
+    fi
+    if ! cleanup_orphaned_window; then
+        activate_existing_window && return 0
+        notify_error 'The UU Remote viewer is still running.'
+        return 1
+    fi
+    if [[ "$window_role" != controller ]] && ! resume_private_client; then
+        notify_error 'The hidden UU management window could not be restored; see client-resume.log.'
+        return 1
+    fi
+
+    stable_client_window="$controller_window"
+    stability_checks=0
+    if [[ "$window_role" != controller ]]; then
+      for _ in {1..240}; do
+        client_window="$(find_client_window | /usr/bin/tail -n 1)"
+        if [[ -n "$client_window" &&
+              "$client_window" == "$stable_client_window" ]]; then
+            stability_checks=$((stability_checks + 1))
+            if ((stability_checks >= 2)); then
+                break
+            fi
+        else
+            stable_client_window="$client_window"
+            stability_checks=0
+        fi
+        sleep 0.25
+      done
+    fi
+    client_window="$stable_client_window"
+    if [[ -z "$client_window" ]]; then
+        notify_error 'The UU management window did not become ready.'
+        return 1
+    fi
+    # Serialize bind/readiness, including separately owned controller windows.
+    # Neither the VNC child nor a detached controller may inherit this lock.
+    exec 7>"$base_runtime_dir/listener-start.lock"
+    /usr/bin/flock -w 10 7 || return 1
+    window_port="$(choose_window_port)" || {
+        notify_error 'No free loopback port is available for the UU window.'
+        return 1
+    }
+
+    printf '%s\n' "$window_port" >"$runtime_dir/window.port"
+    chmod 0600 "$runtime_dir/window.port"
+    trap cleanup_window EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    window_owner_start="$(process_start_time "$$")"
+    if ! IFS= read -r window_capture_nonce </proc/sys/kernel/random/uuid ||
+       [[ ! "$window_capture_nonce" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        notify_error 'The UU manager capture nonce could not be created.'
+        return 1
+    fi
+    window_capture_ready_file="$runtime_dir/capture-ready.$window_capture_nonce"
+    # The Manual owner keeps mapped manager/popups off the desktop root.
+    # Authenticate it before omitting Automatic composition; no stale fallback.
+    if [[ "$window_role" != controller ]]; then
+        if [[ "$manual_route" == rdp-public ]]; then
+            bridge_main_pid="$("${systemctl_user[@]}" show --property=MainPID --value "${UURB_SERVICE_NAME:-uu-remote-bridge.service}")"
+            if ! /usr/bin/env DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+                WINEPREFIX="$prefix" /usr/bin/python3 "$manual_plane_helper" \
+                --check-ready --display "$bridge_display" --prefix "$prefix" \
+                --parent "$bridge_main_pid" --ready "$bridge_runtime_dir/manual-plane.json"; then
+                notify_error 'The Manual desktop owner is not ready; the bridge must recover before management opens.'
+                return 1
+            fi
+            focus_client
+        else
+            # Capture only owned manager frames off-root. Keep the working
+            # legacy desktop route and its SDL focus supervisor active.
+            isolate_manager_root=1
+        fi
+    fi
+
+    # Read the composited manager through its private pixmap, including modals.
+    # Keep management selections separate from the desktop relay clipboard.
+    /usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 \
+        DISPLAY="$bridge_display" XAUTHORITY="$bridge_xauthority" \
+        UURB_MANAGER_WINDOW_ID="$client_window" \
+        UURB_MANAGER_EXPECTED_DISPLAY="$bridge_display" \
+        UURB_MANAGER_CAPTURE_LOG="$state_dir/window-capture.log" \
+        UURB_MANAGER_CAPTURE_READY_FILE="$window_capture_ready_file" \
+        UURB_MANAGER_CAPTURE_NONCE="$window_capture_nonce" \
+        UURB_MANAGER_CAPTURE_ROLE="$window_role" \
+        UURB_MANAGER_CAPTURE_ISOLATE_ROOT="$isolate_manager_root" \
+        UURB_MANAGER_CAPTURE_FPS="$window_capture_fps" \
+        LD_PRELOAD="$manager_capture${LD_PRELOAD:+:$LD_PRELOAD}" \
+        /usr/bin/x11vnc \
+        -norc -nothreads \
+        -display "$bridge_display" \
+        -auth "$bridge_xauthority" \
+        -sid "$client_window" \
+        -nosel \
+        -scale "$window_scale" \
+        "${window_poll_options[@]}" \
+        -rfbport "$window_port" \
+        -listen 127.0.0.1 \
+        -localhost \
+        -no6 \
+        -nopw \
+        -forever \
+        -shared \
+        -noxdamage \
+        -nowf \
+        -noscr \
+        -desktop "${window_desktop:-UU Remote}" \
+        -quiet \
+        >>"$state_dir/window-x11vnc.log" 2>&1 9>&- 7>&- &
+    window_vnc_pid=$!
+    save_window_session
+
+    for _ in {1..80}; do
+        if listener_present "$window_port" &&
+           kill -0 "$window_vnc_pid" >/dev/null 2>&1 &&
+           manager_capture_ready; then
+            ready=true
+            break
+        fi
+        kill -0 "$window_vnc_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        notify_error 'The UU manager capture did not initialize; see window-capture.log and window-x11vnc.log.'
+        return 1
+    fi
+    exec 7>&-
+    if [[ "$isolate_manager_root" == 1 ]]; then
+        release_client || return 1
+    fi
+
+    # Keep this loopback manager on Raw: AutoSelect would switch back to
+    # Tight, which produced malformed rectangles with the scaled capture.
+    set +e
+    local -a viewer_environment=()
+    local viewer_fonts="$HOME/.local/share/uu-remote/tools/uu-tools-fonts.conf"
+    [[ ! -r "$viewer_fonts" ]] || viewer_environment=("FONTCONFIG_FILE=$viewer_fonts")
+    /usr/bin/env "${viewer_environment[@]}" \
+    /usr/bin/vncviewer \
+        -Shared=1 \
+        -PreferredEncoding=Raw \
+        -AutoSelect=0 \
+        -AcceptClipboard=0 \
+        -SendClipboard=0 \
+        -SetPrimary=0 \
+        -SendPrimary=0 \
+        -RemoteResize=0 \
+        -ReconnectOnError=0 \
+        -AlertOnFatalError=0 \
+        -SecurityTypes=None \
+        "127.0.0.1::$window_port" \
+        >>"$state_dir/window-viewer.log" 2>&1 9>&- &
+    # Background + wait so TERM/EXIT traps fire while the viewer runs and the
+    # console always exits together with its viewer instead of blocking the
+    # window lock from inside a foreground wait.
+    window_viewer_pid=$!
+    save_window_session
+    if [[ "$window_role" == controller ]]; then
+        (
+            local watched_viewer_start watched_vnc_start target_lost=false
+            local root_w root_h x y width height pref_x pref_y pref_w pref_h
+            local seen_geometry last_window_geometry fit_state fit_retry=0
+            read -r root_w root_h x y width height pref_x pref_y pref_w pref_h <<<"$controller_fit_state"
+            seen_geometry="$root_w $root_h"
+            last_window_geometry="$x $y $width $height"
+            local -a orphan_session=()
+            watched_viewer_start="$(process_start_time "$window_viewer_pid" || true)"
+            watched_vnc_start="$(process_start_time "$window_vnc_pid" || true)"
+            trap 'exit 0' TERM INT HUP
+            while window_process_matches "$window_viewer_pid" "$watched_viewer_start" vncviewer; do
+                if ! controller_window_matches "$controller_window" "$controller_pid" \
+                    "$controller_start" "$controller_lobby"; then
+                    target_lost=true
+                    break
+                fi
+                if ((SECONDS >= fit_retry)) && fit_state="$(fit_private_controller \
+                    "$controller_fit_helper" "$pref_x" "$pref_y" "$pref_w" "$pref_h" --observe)"; then
+                    read -r root_w root_h x y width height _ _ _ _ <<<"$fit_state"
+                    if [[ "$root_w $root_h" != "$seen_geometry" ]]; then
+                        if fit_state="$(fit_private_controller "$controller_fit_helper" \
+                            "$pref_x" "$pref_y" "$pref_w" "$pref_h")"; then
+                            read -r root_w root_h x y width height _ _ _ _ <<<"$fit_state"
+                            seen_geometry="$root_w $root_h"
+                            last_window_geometry="$x $y $width $height"
+                        else
+                            fit_retry=$((SECONDS + 5))
+                        fi
+                    elif [[ "$x $y $width $height" != "$last_window_geometry" ]]; then
+                        # Remember deliberate resizing on a stable screen. A
+                        # temporary small canvas must not erase the original
+                        # preferred size used when the larger screen returns.
+                        pref_x="$x"; pref_y="$y"; pref_w="$width"; pref_h="$height"
+                        last_window_geometry="$x $y $width $height"
+                    fi
+                fi
+                sleep 0.5
+            done
+            if window_process_matches "$$" "$window_owner_start"; then
+                [[ "$target_lost" != true ]] || kill -TERM "$$" >/dev/null 2>&1 || true
+            else
+                # A killed console leaves its working native controller intact.
+                # Once that viewer closes, this guardian claims only that target
+                # lock and retires the exact sidecar. An unknown viewer exit
+                # status preserves the outgoing UU session for a later reopen.
+                exec 9>"$window_lock_file"
+                /usr/bin/flock -n 9 || exit 0
+                [[ -r "$window_session_file" ]] || exit 0
+                mapfile -t orphan_session <"$window_session_file"
+                [[ "${orphan_session[0]:-}" == "$$" &&
+                   "${orphan_session[1]:-}" == "$window_owner_start" ]] || exit 0
+                window_process_matches "$window_vnc_pid" "$watched_vnc_start" x11vnc || window_vnc_pid=""
+                window_process_matches "$window_viewer_pid" "$watched_viewer_start" vncviewer || window_viewer_pid=""
+                window_watch_pid=""
+                cleanup_window
+            fi
+        ) 9>&- 7>&- &
+    else
+        local controller_owner_pid controller_owner_start
+        controller_owner_pid="$(window_pid "$client_window")"
+        controller_owner_start="$(process_start_time "$controller_owner_pid" || true)"
+        watch_controller_windows "$$" "$window_owner_start" "$client_window" \
+            "$controller_owner_pid" "$controller_owner_start" 9>&- 7>&- &
+    fi
+    window_watch_pid=$!
+    wait "$window_viewer_pid"
+    viewer_status=$?
+    if [[ "$window_role" == controller && "$viewer_status" == 0 ]]; then
+        window_close_requested=true
+    fi
+    set -e
+    return "$viewer_status"
+}
+
+serve_console() {
+    local command
+    local ready=false
+
+    for command in /usr/bin/curl /usr/bin/ss /usr/bin/websockify \
+        /usr/bin/x11vnc /usr/bin/xdotool /usr/bin/xdpyinfo; do
+        if [[ ! -x "$command" ]]; then
+            printf 'UU console dependency is missing: %s\n' "$command" >&2
+            return 1
+        fi
+    done
+    if [[ ! -f "$novnc_root/vnc.html" ]]; then
+        printf 'noVNC web assets are missing from %s.\n' "$novnc_root" >&2
+        return 1
+    fi
+    if ! wait_for_bridge; then
+        printf 'The UU private X display did not become ready.\n' >&2
+        return 1
+    fi
+    if listener_present "$vnc_port" || listener_present "$web_port"; then
+        printf 'UU console port %s or %s is already in use.\n' \
+            "$vnc_port" "$web_port" >&2
+        return 1
+    fi
+
+    /usr/bin/install -d -m 0700 "$runtime_dir" "$state_dir"
+    printf '%s\n' "$bridge_display" >"$runtime_dir/display"
+    printf '%s\n' "$console_url" >"$runtime_dir/url"
+    chmod 0600 "$runtime_dir/display" "$runtime_dir/url"
+    trap cleanup_server EXIT INT TERM HUP
+
+    /usr/bin/env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 \
+        /usr/bin/x11vnc \
+        -display "$bridge_display" \
+        -auth "$bridge_xauthority" \
+        -rfbport "$vnc_port" \
+        -localhost \
+        -no6 \
+        -nopw \
+        -forever \
+        -shared \
+        -quiet \
+        -afteraccept "$script_path focus-client" \
+        -gone "$script_path release-client" \
+        >>"$state_dir/x11vnc.log" 2>&1 &
+    vnc_pid=$!
+
+    for _ in {1..80}; do
+        if listener_present "$vnc_port" &&
+           kill -0 "$vnc_pid" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        kill -0 "$vnc_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        printf 'x11vnc did not expose the UU private display.\n' >&2
+        return 1
+    fi
+
+    /usr/bin/websockify --web="$novnc_root" \
+        "127.0.0.1:$web_port" "127.0.0.1:$vnc_port" \
+        >>"$state_dir/websockify.log" 2>&1 &
+    websockify_pid=$!
+    ready=false
+    for _ in {1..80}; do
+        if /usr/bin/curl --fail --silent --show-error \
+            "http://127.0.0.1:$web_port/vnc.html" >/dev/null 2>&1 &&
+           kill -0 "$websockify_pid" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        kill -0 "$websockify_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        printf 'The UU noVNC endpoint did not become ready.\n' >&2
+        return 1
+    fi
+
+    printf 'UU Remote console: %s (display %s)\n' \
+        "$console_url" "$bridge_display"
+    set +e
+    wait -n "$vnc_pid" "$websockify_pid"
+    set -e
+    return 1
+}
+
+launch_browser() {
+    local profile="$HOME/.local/share/uu-remote-console/chrome-profile"
+
+    /usr/bin/install -d -m 0700 "$profile"
+    if [[ -x /usr/bin/google-chrome ]]; then
+        exec /usr/bin/google-chrome \
+            --app="$console_url" \
+            --class=uu-remote-console \
+            --user-data-dir="$profile" \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-sync
+    elif [[ -x /snap/bin/chromium ]]; then
+        exec /snap/bin/chromium \
+            --app="$console_url" \
+            --class=uu-remote-console \
+            --user-data-dir="$profile" \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-sync
+    fi
+    exec /usr/bin/xdg-open "$console_url"
+}
+
+open_console() {
+    local ready=false
+
+    ensure_bridge || {
+        notify_error 'The Ubuntu desktop bridge could not start.'
+        return 1
+    }
+
+    "${systemctl_user[@]}" reset-failed uu-remote-console.service \
+        >/dev/null 2>&1 || true
+    if ! "${systemctl_user[@]}" start uu-remote-console.service; then
+        notify_error 'The local UU Remote console could not start.'
+        return 1
+    fi
+    for _ in {1..160}; do
+        if /usr/bin/curl --fail --silent \
+            "http://127.0.0.1:$web_port/vnc.html" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$ready" != true ]]; then
+        notify_error 'The local UU Remote console did not become ready.'
+        return 1
+    fi
+    launch_browser
+}
+
+case "${1:-open}" in
+    controller-window)
+        (($# == 5)) || exit 2
+        [[ "$2" =~ ^[1-9][0-9]*$ && "$3" =~ ^[1-9][0-9]*$ &&
+           "$4" =~ ^[1-9][0-9]*$ && "$5" =~ ^[1-9][0-9]*$ ]] || exit 2
+        window_role=controller
+        controller_window="$2" controller_pid="$3" controller_start="$4" controller_lobby="$5"
+        runtime_dir="$base_runtime_dir/controller.$controller_window"
+        state_dir="$base_state_dir/controller.$controller_window"
+        window_lock_file="$runtime_dir/window.lock"
+        window_session_file="$runtime_dir/window-session"
+        window_capture_fps=60
+        window_scale=1
+        window_poll_options=(-wait 5 -defer 0)
+        open_window
+        ;;
+    window)
+        open_window
+        ;;
+    open)
+        open_console
+        ;;
+    serve)
+        serve_console
+        ;;
+    relay)
+        serve_relay_vnc
+        ;;
+    relay-port)
+        printf '%s\n' "$relay_vnc_port"
+        ;;
+    status)
+        printf 'URL: %s\n' "$console_url"
+        printf 'Service: %s\n' \
+            "$("${systemctl_user[@]}" is-active uu-remote-console.service \
+                2>/dev/null || true)"
+        if discover_bridge; then
+            printf 'Bridge display: %s\n' "$bridge_display"
+        else
+            printf 'Bridge display: unavailable\n'
+        fi
+        ;;
+    stop)
+        exec "${systemctl_user[@]}" stop uu-remote-console.service
+        ;;
+    url)
+        printf '%s\n' "$console_url"
+        ;;
+    focus-client)
+        focus_client
+        ;;
+    release-client)
+        release_client
+        ;;
+    *)
+        printf 'usage: uu-remote-console [window|open|serve|relay|relay-port|status|stop|url|focus-client|release-client]\n' \
+            >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,128 @@
+--- a/FreeRDP/client/SDL/SDL3/sdl_context.cpp
++++ b/FreeRDP/client/SDL/SDL3/sdl_context.cpp
+@@ -618,7 +618,8 @@
+ 		DWORD code = freerdp_get_last_error(context());
+ 		freerdp_abort_connect_context(context());
+ 		WLog_Print(getWLog(), WLOG_ERROR, "Authentication only, %s [0x%08" PRIx32 "] %s",
+-		           freerdp_get_last_error_name(code), code, freerdp_get_last_error_string(code));
++		           freerdp_get_last_error_name(code), static_cast<uint32_t>(code),
++		           freerdp_get_last_error_string(code));
+ 		return exit_code;
+ 	}
+ 
+@@ -724,7 +725,7 @@
+ 
+ 			if (freerdp_get_last_error(context()) == FREERDP_ERROR_SUCCESS)
+ 				WLog_Print(getWLog(), WLOG_ERROR, "WaitForMultipleObjects failed with %" PRIu32 "",
+-				           status);
++				           static_cast<uint32_t>(status));
+ 			if (freerdp_get_last_error(context()) == FREERDP_ERROR_SUCCESS)
+ 				WLog_Print(getWLog(), WLOG_ERROR, "Failed to check FreeRDP event handles");
+ 			break;
+@@ -1259,6 +1260,21 @@
+ 	if (!getDisplayChannelContext().handleEvent(ev))
+ 		return false;
+ 
++	if ((ev.type == SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED ||
++	     ev.type == SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED ||
++	     ev.type == SDL_EVENT_DISPLAY_MOVED) && !_rail.enabled())
++	{
++		for (auto& entry : _windows)
++		{
++			auto window = entry.second.window();
++			if ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 &&
++			    SDL_GetDisplayForWindow(window) == ev.displayID &&
++			    SDL_GetWindowFullscreenMode(window) == nullptr &&
++			    !SDL_SetWindowFullscreenMode(window, nullptr))
++				return false;
++		}
++	}
++
+ 	switch (ev.type)
+ 	{
+ 		case SDL_EVENT_DISPLAY_REMOVED: // Can't show details for this one...
+--- a/FreeRDP/client/SDL/SDL3/sdl_clip.cpp
++++ b/FreeRDP/client/SDL/SDL3/sdl_clip.cpp
+@@ -199,7 +199,9 @@
+ 			    SDL_SetClipboardData(sdlClip::ClipDataCb, sdlClip::ClipCleanCb, this, ev.mime_types,
+ 			                         WINPR_ASSERTING_INT_CAST(size_t, ev.num_mime_types));
+ 			_current_mimetypes.clear();
+-			return rc;
++			if (!rc)
++				WLog_Print(_log, WLOG_WARN, "Failed to set local clipboard: %s", SDL_GetError());
++			return true;
+ 		}
+ 		return true;
+ 	}
+@@ -559,6 +561,7 @@
+ 	{
+ 		ClipboardLockGuard systemlock(clipboard->_system);
+ 		std::scoped_lock lock(clipboard->_lock);
++		ClipboardEmpty(clipboard->_system);
+ 		auto res = cliprdr_file_context_notify_new_server_format_list(filecontext);
+ 		if (res != CHANNEL_RC_OK)
+ 			return res;
+--- a/static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsevents.c
++++ b/static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsevents.c
+@@ -2570,6 +2570,24 @@
+     }
+ 
+ #if !defined(SDL_PLATFORM_XBOXONE) && !defined(SDL_PLATFORM_XBOXSERIES)
++    // Wine may update monitor bounds without broadcasting WM_DISPLAYCHANGE.
++    for (SDL_Window *window = _this->windows; window; window = window->next) {
++        if (window->internal && (window->flags & SDL_WINDOW_FULLSCREEN) && !window->fullscreen_exclusive) {
++            SDL_VideoDisplay *display = SDL_GetVideoDisplayForWindow(window);
++            SDL_Rect bounds;
++            if (display && display->internal && WIN_GetDisplayBounds(_this, display, &bounds) &&
++                SDL_memcmp(&display->internal->bounds, &bounds, sizeof(bounds)) != 0) {
++                WIN_RefreshDisplays(_this);
++                break;
++            }
++        }
++    }
++
++    // External clipboard changes do not require a keyboard focus transition.
++    if (_this->windows && _this->windows->internal) {
++        WIN_CheckClipboardUpdate(_this->internal);
++    }
++
+     /* Windows loses a shift KEYUP event when you have both pressed at once and let go of one.
+        You won't get a KEYUP until both are released, and that keyup will only be for the second
+        key you released. Take heroic measures and check the keystate as of the last handled event,
+--- a/static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsclipboard.c
++++ b/static-variant/SDL3-3.2.28/src/video/windows/SDL_windowsclipboard.c
+@@ -239,6 +239,7 @@
+     SDL_VideoData *data = _this->internal;
+     size_t i;
+     bool result = true;
++    HWND hwnd = _this->windows ? _this->windows->internal->hwnd : NULL;
+ 
+     /* I investigated delayed clipboard rendering, and at least with text and image
+      * formats you have to use an output window, not SDL_HelperWindow, and the system
+@@ -273,8 +274,11 @@
+             }
+         }
+ 
+-        data->clipboard_count = GetClipboardSequenceNumber();
+         WIN_CloseClipboard();
++        const Uint32 count = GetClipboardSequenceNumber();
++        if (hwnd && GetClipboardOwner() == hwnd) {
++            data->clipboard_count = count;
++        }
+     } else {
+         result = WIN_SetError("Couldn't open clipboard");
+     }
+@@ -431,9 +435,10 @@
+         if (count) {
+             int nformats = 0;
+             char **new_mime_types = GetMimeTypes(&nformats);
+-            if (new_mime_types) {
+-                SDL_SendClipboardUpdate(false, new_mime_types, nformats);
+-            }
++            if (!new_mime_types) {
++                return; // Keep the pending sequence for the next event pump.
++            }
++            SDL_SendClipboardUpdate(false, new_mime_types, nformats);
+         }
+         data->clipboard_count = count;
+     }

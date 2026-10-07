@@ -1,0 +1,2304 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+umask 077
+
+bridge_user="${USER:-$(id -un)}"
+bridge_display="${UURB_DISPLAY:-auto}"
+desktop_target="${UURB_DESKTOP_TARGET:-auto}"
+desktop_relay="${UURB_DESKTOP_RELAY:-rdp}"
+input_route="${UURB_INPUT_ROUTE:-legacy}"
+plane_fps="${UURB_PLANE_FPS:-60}"
+shared_vnc_port="${UURB_DESKTOP_VNC_PORT:-}"
+vnc_grab_keyboard="${UURB_VNC_GRAB_KEYBOARD:-on}"
+rdp_port="${UURB_RDP_PORT:-3390}"
+resolution="${UURB_RESOLUTION:-1920x1080}"
+follow_desktop_resolution="${UURB_FOLLOW_DESKTOP_RESOLUTION:-off}"
+grd_fd_restart_threshold="${UURB_GRD_FD_RESTART_THRESHOLD:-4096}"
+text_key_delay_ms="${UURB_TEXT_KEY_DELAY_MS:-8}"
+physical_key_delay_ms="${UURB_PHYSICAL_KEY_DELAY_MS:-0}"
+keyboard_route="${UURB_KEYBOARD_ROUTE:-rdp}"
+phone_text_mode="${UURB_PHONE_TEXT_MODE:-auto}"
+network_interface="${UURB_NETWORK_INTERFACE:-all}"
+cursor_guard_setting="${UURB_CURSOR_GUARD:-off}"
+cursor_size_setting="${UURB_CURSOR_SIZE:-auto}"
+uu_audio_setting="${UURB_UU_AUDIO:-system}"
+libei_mode="${UURB_LIBEI_MODE:-auto}"
+wine_prefix="${UURB_WINEPREFIX:-$HOME/.local/share/wineprefixes/uu-remote}"
+service_name="${UURB_SERVICE_NAME:-uu-remote-bridge.service}"
+environment_file="$HOME/.config/uu-remote-bridge/environment"
+manager_display="${DISPLAY:-}"
+manager_wayland="${WAYLAND_DISPLAY:-}"
+manager_session_type="${XDG_SESSION_TYPE:-}"
+manager_xauthority="${XAUTHORITY:-}"
+manager_bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}"
+systemctl_user=(
+    /usr/bin/env
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus"
+    /usr/bin/systemctl --user
+)
+
+if [[ "$input_route" != legacy && "$input_route" != rdp-public ]] ||
+   [[ "$input_route" == rdp-public && "$desktop_relay" != rdp ]] ||
+   [[ ! "$plane_fps" =~ ^[1-9][0-9]{0,2}$ ]] ||
+   ((plane_fps > 120)) ||
+   [[ "$desktop_target" != auto &&
+      "$desktop_target" != xrdp &&
+      "$desktop_target" != physical &&
+      ! "$desktop_target" =~ ^:(0|[1-9][0-9]{0,2})(\.0)?$ ]] ||
+   [[ "$bridge_display" != auto &&
+      ! "$bridge_display" =~ ^:(0|[1-9][0-9]{0,2})$ ]] ||
+   [[ "$desktop_relay" != rdp && "$desktop_relay" != vnc ]] ||
+   [[ "$vnc_grab_keyboard" != off && "$vnc_grab_keyboard" != on ]] ||
+   [[ ! "$rdp_port" =~ ^[1-9][0-9]{0,4}$ ]] ||
+   [[ ! "$resolution" =~ ^[1-9][0-9]{2,4}x[1-9][0-9]{2,4}$ ]] ||
+   [[ "$follow_desktop_resolution" != off &&
+      "$follow_desktop_resolution" != on ]] ||
+   [[ ! "$grd_fd_restart_threshold" =~ ^[0-9]+$ ]] ||
+   [[ ! "$text_key_delay_ms" =~ ^[0-9]+$ ]] ||
+   [[ ! "$physical_key_delay_ms" =~ ^[0-9]+$ ]] ||
+   [[ "$keyboard_route" != rdp &&
+      "$keyboard_route" != x11 &&
+      "$keyboard_route" != auto ]] ||
+   [[ "$phone_text_mode" != auto &&
+      "$phone_text_mode" != keys &&
+      "$phone_text_mode" != clipboard ]] ||
+   [[ "$network_interface" != all &&
+      "$network_interface" != default &&
+      ! "$network_interface" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]] ||
+   [[ "$cursor_guard_setting" != off &&
+      "$cursor_guard_setting" != on ]] ||
+   [[ "$uu_audio_setting" != system &&
+      "$uu_audio_setting" != off ]] ||
+   [[ "$libei_mode" != auto &&
+      "$libei_mode" != system &&
+      "$libei_mode" != backport ]] ||
+   [[ "$cursor_size_setting" != auto &&
+      ! "$cursor_size_setting" =~ ^[0-9]{1,3}$ ]] ||
+   [[ "$wine_prefix" != /* ]]; then
+    printf 'Invalid UURB desktop target, relay, VNC keyboard grab, display, RDP port, resolution, resolution-follow, descriptor, keyboard, network, cursor, audio, libei, or prefix setting.\n' >&2
+    exit 2
+fi
+vnc_grab_keyboard_value=0
+if [[ "$vnc_grab_keyboard" == on ]]; then
+    vnc_grab_keyboard_value=1
+fi
+resolution_width="${resolution%x*}"
+resolution_height="${resolution#*x}"
+if ((rdp_port < 1024 || rdp_port > 65535 ||
+     resolution_width < 640 || resolution_width > 16384 ||
+     resolution_height < 480 || resolution_height > 16384 ||
+     (grd_fd_restart_threshold != 0 &&
+      (grd_fd_restart_threshold < 512 ||
+       grd_fd_restart_threshold > 60000)) ||
+     text_key_delay_ms > 50 || physical_key_delay_ms > 50)); then
+    printf 'UURB port, resolution, descriptor threshold, or keyboard delay is outside the supported range.\n' >&2
+    exit 2
+fi
+if [[ "$cursor_size_setting" != auto ]]; then
+    cursor_size_setting=$((10#$cursor_size_setting))
+    if ((cursor_size_setting < 24 || cursor_size_setting > 128)); then
+        printf 'UURB cursor size is outside the supported range.\n' >&2
+        exit 2
+    fi
+fi
+
+if [[ "$bridge_display" == auto ]]; then
+    for display_number in $(/usr/bin/seq 20 99); do
+        if [[ ! -e "/tmp/.X11-unix/X$display_number" &&
+              ! -e "/tmp/.X${display_number}-lock" ]]; then
+            bridge_display=":$display_number"
+            break
+        fi
+    done
+    if [[ "$bridge_display" == auto ]]; then
+        printf 'No free private X display was found from :20 through :99.\n' >&2
+        exit 1
+    fi
+else
+    display_number="${bridge_display#:}"
+    if [[ -e "/tmp/.X11-unix/X$display_number" ||
+          -e "/tmp/.X${display_number}-lock" ]]; then
+        printf 'Private X display %s is already in use; choose auto or another display.\n' \
+            "$bridge_display" >&2
+        exit 1
+    fi
+fi
+
+export DISPLAY="$bridge_display"
+export WINEPREFIX="$wine_prefix"
+# Honor an operator-provided WINEDEBUG (systemctl --user set-environment)
+# so a bridge restart can capture Wine diagnostics; default stays silent.
+export WINEDEBUG="${WINEDEBUG:--all}"
+# Wine 11 can load its Bluetooth driver despite Services\winebth Start=4.
+# Block that module in this dedicated prefix's process tree, before Wine starts,
+# so ambient Bluetooth observations cannot rebuild the device registry.
+if [[ "$uu_audio_setting" == off ]]; then
+    # UU starts a WebRTC capture stream on every controller connection even
+    # when the nested FreeRDP relay uses /audio-mode:2. Disable Wine's audio
+    # driver only for this dedicated prefix; video and input remain intact.
+    export WINEDLLOVERRIDES='winebth.sys=d;winepulse.drv=d;winedbg.exe=d;mscoree,mshtml='
+else
+    export WINEDLLOVERRIDES='winebth.sys=d;winedbg.exe=d;mscoree,mshtml='
+fi
+export OPENSSL_MODULES='C:\Program Files\FreeRDP\ossl-modules'
+export SDL_RENDER_DRIVER=software
+export UURB_INPUT_ROUTE="$input_route"
+export UU_INPUT_BRIDGE_LOG="C:\\users\\$bridge_user\\Temp\\uu-input-bridge.log"
+export UU_INPUT_BROKER_LOG="C:\\users\\$bridge_user\\Temp\\uu-input-broker.log"
+export UURB_CURSOR_GUARD_LOG="C:\\users\\$bridge_user\\Temp\\uu-cursor-guard.log"
+export UURB_TEXT_KEY_DELAY_MS="$text_key_delay_ms"
+export UURB_PHYSICAL_KEY_DELAY_MS="$physical_key_delay_ms"
+export UURB_PHONE_TEXT_MODE="$phone_text_mode"
+export PATH="/opt/wine-stable/bin:/usr/bin:/bin"
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/uu-remote-bridge"
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/uu-remote-bridge"
+compat_dir="$WINEPREFIX/compat"
+libei_dir="$compat_dir/libei"
+freerdp_exe="$WINEPREFIX/drive_c/Program Files/FreeRDP/sdl-freerdp.exe"
+cursor_guard_dll="$compat_dir/uu-cursor-guard.dll"
+cursor_guard_log="$WINEPREFIX/drive_c/users/$bridge_user/Temp/uu-cursor-guard.log"
+cursor_reader_guard_log="$WINEPREFIX/drive_c/users/$bridge_user/AppData/Local/Temp/uu-cursor-guard.log"
+input_bridge_dll="$compat_dir/uu-input-bridge.dll"
+if [[ "$input_route" == rdp-public ]]; then
+    input_bridge_dll="$WINEPREFIX/drive_c/Program Files/FreeRDP/uu-input-bridge.dll"
+fi
+full_config_path="${input_bridge_dll%/*}/uu-input-public-session.conf"
+input_broker_exe="$compat_dir/uu-input-broker.exe"
+input_broker_probe_exe="$compat_dir/uu-input-broker-probe.exe"
+full_input_plugin="$WINEPREFIX/drive_c/Program Files/FreeRDP/uurb-full-input-client.dll"
+full_ready_helper="$HOME/.local/share/uu-remote/tools/uu-full-ready.py"
+manual_plane_helper="$HOME/.local/share/uu-remote/tools/uu-manual-plane.py"
+manual_plane_ready="$runtime_dir/manual-plane.json"
+manual_plane_pid=""
+full_session_dir=""
+full_ready_dir=""
+full_nonce=""
+full_sdl_linux_pid=""
+full_sdl_linux_start=""
+public_input_ready=false
+public_input_log="$WINEPREFIX/drive_c/users/$bridge_user/AppData/Local/Temp/uu-input-bridge.log"
+x11_input_helper="$compat_dir/uu-x11-input"
+x11_clipboard_helper="$compat_dir/uu-x11-clipboard"
+wine_clipboard_bridge_exe="$compat_dir/uu-wine-clipboard-bridge.exe"
+network_filter="$compat_dir/uu-network-filter.so"
+input_injector_exe="$compat_dir/uu-injector.exe"
+service_control_exe="$compat_dir/uu-service-control.exe"
+uu_app_dir="$WINEPREFIX/drive_c/Program Files/Netease/GameViewer"
+terminal_bridge_helper="$compat_dir/uu-terminal-bridge"
+terminal_proxy_compat="$compat_dir/uu-terminal-proxy.exe"
+terminal_shim_compat="$compat_dir/uu-conpty.dll"
+terminal_proxy_exe="$uu_app_dir/bin/powershell.exe"
+terminal_conpty_dll="$uu_app_dir/bin/conpty.dll"
+terminal_conpty_vendor="$uu_app_dir/bin/conpty.dll.uurb-vendor"
+mux_powershell_dir="$wine_prefix/drive_c/windows/system32/WindowsPowerShell/v1.0"
+mux_proxy_exe="$mux_powershell_dir/powershell.exe"
+mux_proxy_placeholder="$mux_powershell_dir/powershell.exe.uurb-wine"
+mux_config_file="$mux_powershell_dir/uu-terminal-bridge.runtime"
+terminal_config_file="$uu_app_dir/bin/uu-terminal-bridge.runtime"
+xauth_file="$runtime_dir/Xauthority"
+x11_input_ready_file="$runtime_dir/x11-input.port"
+x11_clipboard_ready_file="$runtime_dir/x11-clipboard.port"
+terminal_ready_file="$runtime_dir/terminal.port"
+private_display_file="$runtime_dir/private-display"
+console_focus_file="$runtime_dir/console-focus"
+wine_stop_bin="$HOME/.local/libexec/uu-remote-stop-wine-prefix"
+
+# Ubuntu >= 26.04 ships libei >= 1.3 with the upstream keymap-FD fix
+# (ee27dd5c92e4), so the isolated 1.2.1 backport is only required where the
+# system library still leaks the received keymap descriptor.
+use_backport_libei=false
+if [[ -x "$libei_dir/libei.so.1.2.1" && -L "$libei_dir/libei.so.1" ]] &&
+   [[ "$libei_mode" == backport || "$libei_mode" == auto ]]; then
+    use_backport_libei=true
+elif [[ "$libei_mode" == backport ]]; then
+    printf 'The patched libei keymap-FD backport is required but missing; reinstall the bridge.\n' >&2
+    exit 1
+fi
+
+xvfb_pid=""
+openbox_pid=""
+grd_pid=""
+freerdp_pid=""
+desktop_x11vnc_pid=""
+vncviewer_pid=""
+winlogon_pid=""
+input_broker_pid=""
+x11_input_pid=""
+x11_clipboard_pid=""
+wine_clipboard_bridge_pid=""
+terminal_bridge_pid=""
+server_supervisor_pid=""
+grd_user_service_was_active=false
+desktop_bus=""
+monitor_fallback_original=""
+monitor_fallback_value=""
+desktop_monitor_watch=false
+desktop_display=""
+desktop_wayland=""
+desktop_session_type=""
+desktop_xauthority=""
+desktop_session_id=""
+desktop_session_service=""
+desktop_session_seat=""
+active_network_interface=""
+active_keyboard_route="rdp"
+x11_input_semantic_only=false
+desktop_vnc_port=""
+cursor_size=""
+x11_input_port=""
+x11_input_token=""
+x11_clipboard_port=""
+x11_clipboard_token=""
+terminal_bridge_port=""
+terminal_bridge_token=""
+
+log() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*"
+}
+
+desktop_geometry() {
+    local height
+    local selected_xauthority
+    local width
+
+    [[ "$desktop_session_type" == x11 && -n "$desktop_display" ]] ||
+        return 1
+    selected_xauthority="$desktop_xauthority"
+    if [[ -z "$selected_xauthority" && -f "$HOME/.Xauthority" ]]; then
+        selected_xauthority="$HOME/.Xauthority"
+    fi
+    read -r width height < <(
+        /usr/bin/env \
+            DISPLAY="$desktop_display" \
+            XAUTHORITY="$selected_xauthority" \
+            /usr/bin/xdotool getdisplaygeometry 2>/dev/null
+    ) || return 1
+    [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || return 1
+    # Ignore transient tiny RDP windows. They are useful client-side sizes,
+    # but not stable canvases for an unattended shared workstation.
+    ((width >= 1024 && width <= 16384 &&
+      height >= 720 && height <= 16384)) || return 1
+    printf '%sx%s\n' "$width" "$height"
+}
+
+persist_relay_resolution() {
+    local new_resolution="$1"
+    local temporary
+
+    [[ -f "$environment_file" ]] || return 1
+    temporary="$(/usr/bin/mktemp \
+        "$HOME/.config/uu-remote-bridge/.environment.XXXXXX")" || return 1
+    if ! /usr/bin/awk -v value="$new_resolution" '
+        BEGIN { replaced = 0 }
+        /^UURB_RESOLUTION=/ {
+            if (!replaced) {
+                print "UURB_RESOLUTION=" value
+                replaced = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!replaced)
+                print "UURB_RESOLUTION=" value
+        }
+    ' "$environment_file" >"$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    chmod 0600 "$temporary"
+    mv "$temporary" "$environment_file"
+}
+
+align_resolution_at_startup() {
+    local selected_resolution
+
+    [[ "$follow_desktop_resolution" == on ]] || return 0
+    if [[ "$desktop_relay" != vnc || "$desktop_session_type" != x11 ]]; then
+        log 'Desktop-resolution following requires the VNC relay and an X11 target; retaining the saved size.'
+        return 0
+    fi
+    selected_resolution="$(desktop_geometry || true)"
+    if [[ -z "$selected_resolution" ||
+          "$selected_resolution" == "$resolution" ]]; then
+        return 0
+    fi
+    if ! persist_relay_resolution "$selected_resolution"; then
+        log 'Could not persist the followed desktop resolution.'
+        return 1
+    fi
+    log "Following the selected desktop resolution: $resolution -> $selected_resolution."
+    resolution="$selected_resolution"
+    resolution_width="${resolution%x*}"
+    resolution_height="${resolution#*x}"
+}
+
+raise_open_file_limit() {
+    local hard_limit
+    local soft_limit
+    local target_limit=65536
+
+    soft_limit="$(ulimit -Sn)"
+    hard_limit="$(ulimit -Hn)"
+    if [[ "$hard_limit" != unlimited ]] &&
+       ((hard_limit < target_limit)); then
+        target_limit="$hard_limit"
+    fi
+    if [[ "$soft_limit" != unlimited ]] &&
+       ((soft_limit < target_limit)); then
+        if ! ulimit -Sn "$target_limit"; then
+            log "Could not raise the open-file limit above $soft_limit."
+            return 0
+        fi
+        log "Raised the open-file limit from $soft_limit to $target_limit."
+    fi
+}
+
+raise_open_file_limit
+
+select_network_interface() {
+    local candidate
+
+    [[ "$network_interface" != all ]] || return 0
+    if [[ "$network_interface" == default ]]; then
+        candidate="$(default_network_interface)"
+    else
+        candidate="$network_interface"
+    fi
+    if [[ -n "$candidate" && -d "/sys/class/net/$candidate" ]]; then
+        active_network_interface="$candidate"
+        log "UU adapter selection is limited to $candidate plus loopback."
+    else
+        log "Configured UU adapter $network_interface is unavailable; preserving the unfiltered adapter list."
+    fi
+}
+
+default_network_interface() {
+    /usr/bin/ip -4 route show default 2>/dev/null | \
+        /usr/bin/awk '
+            {
+                interface = ""
+                route_metric = 0
+                for (i = 1; i <= NF; ++i) {
+                    if ($i == "dev")
+                        interface = $(i + 1)
+                    else if ($i == "metric")
+                        route_metric = $(i + 1)
+                }
+                if (interface != "")
+                    print route_metric, interface
+            }
+        ' | /usr/bin/sort -n -k1,1 | /usr/bin/awk 'NR == 1 {print $2}'
+}
+
+resolve_cursor_size() {
+    local -a display_environment
+    local detected=""
+    local cursor_theme=""
+    local configuration_tmp
+
+    if [[ "$cursor_size_setting" != auto ]]; then
+        cursor_size="$cursor_size_setting"
+    elif [[ -n "$desktop_display" ]]; then
+        display_environment=(
+            /usr/bin/env
+            "DISPLAY=$desktop_display"
+        )
+        if [[ -n "$desktop_xauthority" ]]; then
+            display_environment+=("XAUTHORITY=$desktop_xauthority")
+        fi
+        detected="$(
+            "${display_environment[@]}" /usr/bin/xrdb -query 2>/dev/null | \
+                /usr/bin/awk '
+                    $1 == "Xcursor.size:" && $2 ~ /^[0-9]+$/ {
+                        if (length($2) <= 3)
+                            print $2
+                        exit
+                    }
+                '
+        )"
+    fi
+
+    if [[ "$cursor_size_setting" == auto ]]; then
+        if [[ "$detected" =~ ^[0-9]{1,3}$ ]]; then
+            detected=$((10#$detected))
+        fi
+        if [[ "$detected" =~ ^[0-9]+$ ]] &&
+           ((detected >= 24 && detected <= 128)); then
+            cursor_size="$detected"
+        else
+            # GNOME's gsettings value is logical and may omit compositor scale.
+            cursor_size=48
+        fi
+    fi
+
+    export UURB_CURSOR_SIZE="$cursor_size"
+    log "UU cursor compatibility size is ${cursor_size}x${cursor_size}."
+    configuration_tmp="$(/usr/bin/mktemp "$compat_dir/.uu-cursor.ini.XXXXXX")"
+    if ! printf '[Cursor]\nSize=%s\nRelayLogPath=%s\n' \
+            "$cursor_size" "$UURB_CURSOR_GUARD_LOG" >"$configuration_tmp" ||
+       ! chmod 0600 "$configuration_tmp" ||
+       ! mv "$configuration_tmp" "$compat_dir/uu-cursor.ini"; then
+        rm -f "$configuration_tmp"
+        log 'Could not persist the cursor size for the UU Wine service.'
+        return 1
+    fi
+    log "UU cursor guard configuration saved for Wine services: Size=$cursor_size."
+    if [[ -n "$desktop_display" ]]; then
+        cursor_theme="$(/usr/bin/env DISPLAY="$desktop_display" \
+            XAUTHORITY="$desktop_xauthority" /usr/bin/xrdb -query 2>/dev/null | \
+            /usr/bin/awk '$1 == "Xcursor.theme:" {print $2; exit}' || true)"
+    fi
+    if [[ -z "$cursor_theme" ]]; then
+        cursor_theme="$(/usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+            /usr/bin/gsettings get org.gnome.desktop.interface cursor-theme \
+            2>/dev/null || true)"
+        cursor_theme="${cursor_theme#\'}"
+        cursor_theme="${cursor_theme%\'}"
+    fi
+    if /usr/bin/python3 "$HOME/.local/libexec/uu-cursor-asset.py" \
+        --theme "$cursor_theme" --size "$cursor_size" \
+        --output "$compat_dir/uu-cursor.cur"; then
+        log "UU cursor uses desktop theme '${cursor_theme:-default}' at ${cursor_size}x${cursor_size}."
+    else
+        rm -f "$compat_dir/uu-cursor.cur"
+        log 'UU cursor theme export failed; retaining the built-in cursor fallback.'
+    fi
+}
+
+cleanup() {
+    local display_lock
+    local display_socket
+    local lock_pid
+    local pid
+    local processes_alive
+    local prefix_quiescent=false
+
+    trap - EXIT INT TERM HUP
+
+    rm -f \
+        "$terminal_config_file" \
+        "${terminal_config_file}.$$.tmp" \
+        "$mux_config_file" \
+        "${mux_config_file}.$$.tmp"
+
+    if [[ -n "$manual_plane_pid" ]]; then
+        # Stop accepting producer input and stop painting before Wine teardown.
+        for pid in "$server_supervisor_pid"; do
+            [[ -z "$pid" ]] || kill "$pid" >/dev/null 2>&1 || true
+        done
+        kill -TERM "$manual_plane_pid" >/dev/null 2>&1 || true
+        for _ in {1..30}; do
+            if /usr/bin/python3 - "$manual_plane_ready" <<'ACK'
+import json,sys
+from pathlib import Path
+try:assert json.loads(Path(sys.argv[1]).read_text())['phase'] in ('STOPPING_HELD','FAILED_HELD')
+except (OSError,ValueError,KeyError,AssertionError):sys.exit(1)
+ACK
+            then break; fi
+            kill -0 "$manual_plane_pid" >/dev/null 2>&1 || break
+            sleep .05
+        done
+        if /usr/bin/bash "$wine_stop_bin" "$WINEPREFIX" /opt/wine-stable/bin/wineserver &&
+           /usr/bin/python3 "$full_ready_helper" --mark-stopped \
+               --prefix "$WINEPREFIX" --parent "$$" --nonce "$full_nonce" \
+               --output "$full_session_dir/prefix-stopped.json"; then
+            prefix_quiescent=true
+            for _ in {1..50}; do
+                kill -0 "$manual_plane_pid" >/dev/null 2>&1 || break
+                sleep .02
+            done
+        else
+            log 'Exact prefix quiescence failed; keeping Manual ownership until owned teardown.'
+        fi
+        if kill -0 "$manual_plane_pid" >/dev/null 2>&1; then
+            # If quiescence cannot be proved, end the owned X server before
+            # forcing the compositor away; no live Wine root is exposed.
+            if [[ "$prefix_quiescent" != true ]]; then
+                kill -TERM "$xvfb_pid" >/dev/null 2>&1 || true
+                for _ in {1..20}; do
+                    kill -0 "$xvfb_pid" >/dev/null 2>&1 || break
+                    sleep .05
+                done
+                kill -KILL "$xvfb_pid" >/dev/null 2>&1 || true
+            fi
+            kill -KILL "$manual_plane_pid" >/dev/null 2>&1 || true
+        fi
+        wait "$manual_plane_pid" 2>/dev/null || true
+    fi
+
+    for pid in \
+        "$server_supervisor_pid" \
+        "$input_broker_pid" \
+        "$x11_input_pid" \
+        "$wine_clipboard_bridge_pid" \
+        "$x11_clipboard_pid" \
+        "$terminal_bridge_pid" \
+        "$winlogon_pid" \
+        "$vncviewer_pid" \
+        "$freerdp_pid" \
+        "$desktop_x11vnc_pid" \
+        "$grd_pid" \
+        "$openbox_pid" \
+        "$xvfb_pid"; do
+        if [[ -n "$manual_plane_pid" && ( "$pid" == "$input_broker_pid" ||
+              "$pid" == "$winlogon_pid" || "$pid" == "$freerdp_pid" ||
+              "$pid" == "$wine_clipboard_bridge_pid" ) ]]; then continue; fi
+        if [[ -n "$pid" ]]; then
+            kill "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+
+    for _ in {1..10}; do
+        processes_alive=false
+        for pid in \
+            "$server_supervisor_pid" \
+            "$input_broker_pid" \
+            "$x11_input_pid" \
+            "$wine_clipboard_bridge_pid" \
+            "$x11_clipboard_pid" \
+            "$terminal_bridge_pid" \
+            "$winlogon_pid" \
+            "$vncviewer_pid" \
+            "$freerdp_pid" \
+            "$desktop_x11vnc_pid" \
+            "$grd_pid" \
+            "$openbox_pid" \
+            "$xvfb_pid"; do
+            if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+                processes_alive=true
+                break
+            fi
+        done
+        [[ "$processes_alive" == false ]] && break
+        sleep 0.1
+    done
+
+    for pid in \
+        "$server_supervisor_pid" \
+        "$input_broker_pid" \
+        "$x11_input_pid" \
+        "$wine_clipboard_bridge_pid" \
+        "$x11_clipboard_pid" \
+        "$terminal_bridge_pid" \
+        "$winlogon_pid" \
+        "$vncviewer_pid" \
+        "$freerdp_pid" \
+        "$desktop_x11vnc_pid" \
+        "$grd_pid" \
+        "$openbox_pid" \
+        "$xvfb_pid"; do
+        if [[ -n "$manual_plane_pid" && ( "$pid" == "$input_broker_pid" ||
+              "$pid" == "$winlogon_pid" || "$pid" == "$freerdp_pid" ||
+              "$pid" == "$wine_clipboard_bridge_pid" ) ]]; then continue; fi
+        if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+            kill -KILL "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+
+    restore_desktop_monitor_mode
+
+    if [[ -z "$manual_plane_pid" ]]; then
+        /usr/bin/bash "$wine_stop_bin" \
+            "$WINEPREFIX" /opt/wine-stable/bin/wineserver || true
+    fi
+
+    display_lock="/tmp/.X${display_number}-lock"
+    display_socket="/tmp/.X11-unix/X${display_number}"
+    lock_pid="$(
+        if [[ -r "$display_lock" ]]; then
+            /usr/bin/tr -d '[:space:]' 2>/dev/null <"$display_lock" || true
+        fi
+    )"
+    if [[ -n "$xvfb_pid" && "$lock_pid" == "$xvfb_pid" &&
+          ! -d "/proc/$xvfb_pid" ]]; then
+        rm -f "$display_lock" "$display_socket"
+    fi
+
+    if [[ "$grd_user_service_was_active" == true ]]; then
+        "${systemctl_user[@]}" start gnome-remote-desktop.service \
+            >/dev/null 2>&1 || true
+    fi
+
+    rm -f \
+        "$xauth_file" \
+        "$x11_input_ready_file" \
+        "$x11_clipboard_ready_file" \
+        "$terminal_ready_file" \
+        "$private_display_file" \
+        "$console_focus_file"
+}
+
+trap cleanup EXIT
+trap 'exit 0' INT TERM HUP
+
+process_environment_value() {
+    local name="$1"
+    local pid="$2"
+
+    /usr/bin/tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | \
+        /usr/bin/sed -n "s/^${name}=//p" | /usr/bin/head -n 1
+}
+
+wine_prefix_process_pid() {
+    local pattern="$1"
+    local candidate
+    local candidate_prefix
+
+    while read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        candidate_prefix="$(process_environment_value WINEPREFIX "$candidate" || true)"
+        if [[ "$candidate_prefix" == "$WINEPREFIX" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(pgrep -u "$UID" -f "$pattern" || true)
+    return 1
+}
+
+wine_process_identity() {
+    local pid="$1"
+    local stat
+    local -a fields
+
+    wine_process_starttime=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+    read -r stat <"/proc/$pid/stat" 2>/dev/null || return 1
+    # The process name may contain spaces or parentheses. Field 3 follows
+    # the final closing parenthesis; starttime is field 22.
+    read -r -a fields <<<"${stat##*) }"
+    [[ ${#fields[@]} -ge 20 && "${fields[0]}" != Z &&
+       "${fields[0]}" != X && "${fields[0]}" != x &&
+       "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+    wine_process_starttime="${fields[19]}"
+}
+
+refresh_manager_environment() {
+    local environment
+    local value
+
+    environment="$(
+        "${systemctl_user[@]}" show-environment 2>/dev/null || true
+    )"
+
+    value="$(
+        printf '%s\n' "$environment" |
+            /usr/bin/sed -n 's/^DISPLAY=//p' |
+            /usr/bin/head -n 1
+    )"
+    manager_display="${value:-$manager_display}"
+    value="$(
+        printf '%s\n' "$environment" |
+            /usr/bin/sed -n 's/^WAYLAND_DISPLAY=//p' |
+            /usr/bin/head -n 1
+    )"
+    manager_wayland="${value:-$manager_wayland}"
+    value="$(
+        printf '%s\n' "$environment" |
+            /usr/bin/sed -n 's/^XDG_SESSION_TYPE=//p' |
+            /usr/bin/head -n 1
+    )"
+    manager_session_type="${value:-$manager_session_type}"
+    value="$(
+        printf '%s\n' "$environment" |
+            /usr/bin/sed -n 's/^XAUTHORITY=//p' |
+            /usr/bin/head -n 1
+    )"
+    manager_xauthority="${value:-$manager_xauthority}"
+    value="$(
+        printf '%s\n' "$environment" |
+            /usr/bin/sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' |
+            /usr/bin/head -n 1
+    )"
+    manager_bus="${value:-$manager_bus}"
+}
+
+normalized_x_display() {
+    local display="$1"
+
+    printf '%s\n' "${display%%.*}"
+}
+
+desktop_candidate_matches_target() {
+    local candidate_display="$1"
+    local candidate_service="$2"
+    local candidate_seat="$3"
+    local candidate_bus="$4"
+    local candidate_xauthority="${5:-}"
+    local normalized_candidate
+    local normalized_target
+
+    case "$desktop_target" in
+        xrdp)
+            [[ "$candidate_service" == xrdp-sesman ]]
+            ;;
+        physical)
+            [[ "$candidate_xauthority" == "${XDG_RUNTIME_DIR:-/run/user/$UID}/gdm/Xauthority" ||
+               -n "$candidate_seat" || "$candidate_service" == gdm-* ]]
+            ;;
+        :*)
+            normalized_candidate="$(normalized_x_display "$candidate_display")"
+            normalized_target="$(normalized_x_display "$desktop_target")"
+            [[ -n "$candidate_display" &&
+               "$normalized_candidate" == "$normalized_target" ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+select_desktop_candidate() {
+    desktop_bus="$1"
+    desktop_display="$2"
+    desktop_wayland="$3"
+    desktop_session_type="$4"
+    desktop_xauthority="$5"
+    desktop_session_id="$6"
+    desktop_session_service="$7"
+    desktop_session_seat="$8"
+}
+
+discover_desktop_session() {
+    local candidate_bus
+    local candidate_display
+    local candidate_session_type
+    local candidate_session_id
+    local candidate_session_service
+    local candidate_session_seat
+    local candidate_state
+    local candidate_wayland
+    local candidate_xauthority
+    local fallback_bus=""
+    local fallback_display=""
+    local fallback_session_type=""
+    local fallback_wayland=""
+    local fallback_xauthority=""
+    local fallback_session_id=""
+    local fallback_session_service=""
+    local fallback_session_seat=""
+    local pid
+
+    # The user service can start before GDM imports the graphical session
+    # variables. Refresh them while waiting instead of caching the boot race.
+    refresh_manager_environment
+
+    while read -r pid; do
+        [[ -n "$pid" && -r "/proc/$pid/environ" ]] || continue
+        candidate_bus="$(process_environment_value \
+            DBUS_SESSION_BUS_ADDRESS "$pid")"
+        candidate_display="$(process_environment_value DISPLAY "$pid")"
+        candidate_wayland="$(process_environment_value WAYLAND_DISPLAY "$pid")"
+        candidate_xauthority="$(process_environment_value XAUTHORITY "$pid")"
+        candidate_session_type="$(process_environment_value \
+            XDG_SESSION_TYPE "$pid")"
+        candidate_session_service=""
+        candidate_session_seat=""
+        [[ -n "$candidate_bus" ]] || continue
+        if [[ "$candidate_bus" == "$manager_bus" ]]; then
+            candidate_display="${candidate_display:-$manager_display}"
+            candidate_wayland="${candidate_wayland:-$manager_wayland}"
+            candidate_session_type="${candidate_session_type:-$manager_session_type}"
+            candidate_xauthority="${candidate_xauthority:-$manager_xauthority}"
+        fi
+        [[ -n "$candidate_display" || -n "$candidate_wayland" ]] || continue
+        candidate_session_id="$(
+            /usr/bin/sed -n \
+                's#.*session-\([^/]*\)\.scope.*#\1#p' \
+                "/proc/$pid/cgroup" 2>/dev/null | /usr/bin/head -n 1
+        )"
+        if [[ -n "$candidate_session_id" ]]; then
+            candidate_state="$(
+                /usr/bin/loginctl show-session "$candidate_session_id" \
+                    --property=State --value 2>/dev/null || true
+            )"
+            [[ "$candidate_state" == active || \
+               "$candidate_state" == online ]] || continue
+            candidate_session_service="$(
+                /usr/bin/loginctl show-session "$candidate_session_id" \
+                    --property=Service --value 2>/dev/null || true
+            )"
+            candidate_session_seat="$(
+                /usr/bin/loginctl show-session "$candidate_session_id" \
+                    --property=Seat --value 2>/dev/null || true
+            )"
+        fi
+
+        if [[ "$desktop_target" != auto ]]; then
+            if desktop_candidate_matches_target \
+                "$candidate_display" "$candidate_session_service" \
+                "$candidate_session_seat" "$candidate_bus" "$candidate_xauthority"; then
+                select_desktop_candidate \
+                    "$candidate_bus" "$candidate_display" \
+                    "$candidate_wayland" "$candidate_session_type" \
+                    "$candidate_xauthority" "$candidate_session_id" \
+                    "$candidate_session_service" "$candidate_session_seat"
+                return 0
+            fi
+            continue
+        fi
+
+        if [[ -z "$fallback_bus" ]]; then
+            fallback_bus="$candidate_bus"
+            fallback_display="$candidate_display"
+            fallback_wayland="$candidate_wayland"
+            fallback_session_type="$candidate_session_type"
+            fallback_xauthority="$candidate_xauthority"
+            fallback_session_id="$candidate_session_id"
+            fallback_session_service="$candidate_session_service"
+            fallback_session_seat="$candidate_session_seat"
+        fi
+        if [[ -n "$manager_display" && \
+              "$candidate_display" == "$manager_display" ]]; then
+            select_desktop_candidate \
+                "$candidate_bus" "$candidate_display" \
+                "$candidate_wayland" "$candidate_session_type" \
+                "$candidate_xauthority" "$candidate_session_id" \
+                "$candidate_session_service" "$candidate_session_seat"
+            return 0
+        fi
+    done < <(/usr/bin/pgrep -u "$UID" -x gnome-shell | /usr/bin/sort -nr)
+
+    if [[ -n "$fallback_bus" ]]; then
+        select_desktop_candidate \
+            "$fallback_bus" "$fallback_display" "$fallback_wayland" \
+            "$fallback_session_type" "$fallback_xauthority" \
+            "$fallback_session_id" "$fallback_session_service" \
+            "$fallback_session_seat"
+        return 0
+    fi
+
+    # Terminal-only / headless deployment: an explicit numeric target can be
+    # a bare Xvfb canvas with no gnome-shell session to discover. Select it
+    # directly when reachable so a canvas-only host can serve the VNC relay.
+    if [[ "$desktop_target" =~ ^:(0|[1-9][0-9]{0,2})(\.0)?$ ]] && \
+       /usr/bin/xdpyinfo -display "$desktop_target" >/dev/null 2>&1; then
+        select_desktop_candidate \
+            "$manager_bus" "$desktop_target" "" "x11" \
+            "" "" "" ""
+        return 0
+    fi
+    return 1
+}
+
+reuse_shared_vnc_relay() {
+    local pid cmdline listening
+    [[ "$shared_vnc_port" =~ ^[1-9][0-9]{3}$ ]] &&
+        ((shared_vnc_port >= 5900 && shared_vnc_port <= 5999)) || {
+        log 'UURB_DESKTOP_VNC_PORT must be in 5900..5999.'
+        return 1
+    }
+    for _ in {1..50}; do
+        listening="$(/usr/bin/ss -H -ltnp "sport = :$shared_vnc_port" 2>/dev/null)"
+        while read -r pid; do
+            [[ -r "/proc/$pid/cmdline" ]] || continue
+            cmdline=" $(/usr/bin/tr '\0' ' ' <"/proc/$pid/cmdline") "
+            [[ "$cmdline" == *" -localhost "* && "$cmdline" == *" -nopw "* ]] || continue
+            [[ "$cmdline" == *" -display ${desktop_display%%.*} "* ||
+               "$cmdline" == *" -display ${desktop_display%%.*}.0 "* ]] || continue
+            if [[ "$listening" == *"127.0.0.1:$shared_vnc_port "* &&
+                  "$listening" == *"pid=$pid,"* ]]; then
+                desktop_vnc_port="$shared_vnc_port"
+                # This service owns its process. Never add it to UU cleanup.
+                log "Reusing independently managed VNC for $desktop_display on 127.0.0.1:$desktop_vnc_port."
+                return 0
+            fi
+        done < <(/usr/bin/pgrep -u "$UID" -x x11vnc || true)
+        sleep 0.1
+    done
+    log 'Configured shared VNC relay is unavailable or targets a different desktop.'
+    return 1
+}
+
+physical_monitor_state() {
+    local state
+
+    if ! state="$(/usr/bin/busctl --user --address="$desktop_bus" \
+        --json=short --timeout=2 call org.gnome.Mutter.DisplayConfig \
+        /org/gnome/Mutter/DisplayConfig org.gnome.Mutter.DisplayConfig \
+        GetCurrentState 2>/dev/null)"; then
+        printf 'unknown\n'
+        return 0
+    fi
+    /usr/bin/python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)["data"]
+    if not isinstance(data, list) or len(data) != 4:
+        raise ValueError("invalid state")
+    logicals = data[2]
+    if not isinstance(logicals, list):
+        raise ValueError("invalid logical monitors")
+    physical = False
+    for logical in logicals:
+        if not isinstance(logical, list) or len(logical) != 7:
+            raise ValueError("invalid logical monitor")
+        specs = logical[5]
+        if not isinstance(specs, list) or not specs:
+            raise ValueError("invalid monitor specifications")
+        for spec in specs:
+            if not isinstance(spec, list) or len(spec) != 4 or not all(
+                isinstance(value, str) for value in spec
+            ):
+                raise ValueError("invalid monitor specification")
+            connector, vendor, product, _ = spec
+            if (not connector.startswith("Meta-") and vendor != "MetaVendor"
+                    and product != "Virtual remote monitor"):
+                physical = True
+    print("present" if physical else "absent")
+except (KeyError, TypeError, ValueError):
+    print("unknown")
+' <<<"$state"
+}
+
+configure_desktop_monitor_mode() {
+    local original
+    local saved
+    local temporary
+
+    [[ "$desktop_session_type" == wayland ]] || return 0
+    original="$(/usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+        /usr/bin/gsettings get org.gnome.desktop.remote-desktop.rdp \
+        screen-share-mode 2>/dev/null)" || return 0
+    # dconf survives SIGKILL. Recover ownership left by a previous bridge,
+    # including a crash between writing the marker and changing the setting.
+    if [[ -f "$state_dir/monitor-fallback.mode" ]]; then
+        saved="$(/usr/bin/cat "$state_dir/monitor-fallback.mode")" || return 0
+        if [[ "$saved" != $'\'mirror-primary\'\n\'extend\'' ]]; then
+            log 'Ignoring an invalid GNOME monitor fallback ownership marker.'
+            return 0
+        fi
+        if [[ "$original" == "'extend'" ]]; then
+            monitor_fallback_original="'mirror-primary'"
+            monitor_fallback_value="'extend'"
+            desktop_monitor_watch=true
+            if [[ "$(physical_monitor_state)" == present ]]; then
+                restore_desktop_monitor_mode
+                if [[ -n "$monitor_fallback_original" ]]; then
+                    desktop_monitor_watch=false
+                    log 'Could not restore GNOME mirror mode; retaining the owned virtual monitor without repeated restarts.'
+                    return 0
+                fi
+                original="'mirror-primary'"
+            else
+                log 'Recovered ownership of the GNOME virtual monitor fallback from a previous bridge.'
+                return 0
+            fi
+        else
+            rm -f "$state_dir/monitor-fallback.mode"
+        fi
+    fi
+    [[ "$original" == "'mirror-primary'" ]] || return 0
+    desktop_monitor_watch=true
+    [[ "$(physical_monitor_state)" == absent ]] || return 0
+    temporary="$(/usr/bin/mktemp "$state_dir/.monitor-fallback.XXXXXX")" || {
+        desktop_monitor_watch=false
+        log 'Could not save GNOME monitor fallback ownership; retaining the original mode.'
+        return 0
+    }
+    if ! printf "'mirror-primary'\n'extend'\n" >"$temporary" ||
+       ! chmod 0600 "$temporary" ||
+       ! mv "$temporary" "$state_dir/monitor-fallback.mode"; then
+        rm -f "$temporary"
+        desktop_monitor_watch=false
+        log 'Could not save GNOME monitor fallback ownership; retaining the original mode.'
+        return 0
+    fi
+    if /usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+        /usr/bin/gsettings set org.gnome.desktop.remote-desktop.rdp \
+        screen-share-mode extend; then
+        monitor_fallback_original="$original"
+        monitor_fallback_value="'extend'"
+        log 'No active physical monitor; temporarily sharing a GNOME virtual monitor for unattended access.'
+    else
+        rm -f "$state_dir/monitor-fallback.mode"
+        desktop_monitor_watch=false
+        log 'Could not enable the GNOME virtual monitor fallback.'
+    fi
+}
+
+restore_desktop_monitor_mode() {
+    local current
+
+    [[ -n "$monitor_fallback_original" ]] || return 0
+    current="$(/usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+        /usr/bin/gsettings get org.gnome.desktop.remote-desktop.rdp \
+        screen-share-mode 2>/dev/null)" || return 0
+    if [[ "$current" != "$monitor_fallback_value" ]]; then
+        rm -f "$state_dir/monitor-fallback.mode"
+        monitor_fallback_original=""
+        monitor_fallback_value=""
+        return 0
+    fi
+    if /usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+        /usr/bin/gsettings set org.gnome.desktop.remote-desktop.rdp \
+        screen-share-mode "$monitor_fallback_original"; then
+        rm -f "$state_dir/monitor-fallback.mode"
+        monitor_fallback_original=""
+        monitor_fallback_value=""
+        log 'Restored the original GNOME screen sharing mode after stopping the virtual monitor relay.'
+    fi
+}
+
+start_desktop_relay() {
+    local -a desktop_environment
+    local desktop_vnc_log
+    local native_openssl_modules
+    local selected_xauthority
+    local selected_desktop
+
+    if ! discover_desktop_session; then
+        log "Waiting for logged-in GNOME desktop target '$desktop_target'."
+        until discover_desktop_session; do
+            sleep 5
+        done
+    fi
+
+    selected_desktop="${desktop_display:-$desktop_wayland}"
+    log "Desktop target '$desktop_target' selected ${desktop_session_service:-unknown} session ${desktop_session_id:-unknown} on ${selected_desktop:-unknown}."
+
+    if [[ "$desktop_relay" == vnc ]]; then
+        if [[ "$desktop_session_type" != x11 || -z "$desktop_display" ]]; then
+            log "The VNC desktop relay requires an X11/XRDP target; selected ${desktop_session_type:-unknown}."
+            return 1
+        fi
+        selected_xauthority="$desktop_xauthority"
+        if [[ -z "$selected_xauthority" && -f "$HOME/.Xauthority" ]]; then
+            selected_xauthority="$HOME/.Xauthority"
+        fi
+        if ! /usr/bin/env DISPLAY="$desktop_display" \
+            XAUTHORITY="$selected_xauthority" \
+            /usr/bin/xdpyinfo >/dev/null 2>&1; then
+            log 'The VNC relay cannot access the selected X11 desktop.'
+            return 1
+        fi
+
+        if [[ -n "$shared_vnc_port" ]]; then
+            reuse_shared_vnc_relay
+            return $?
+        fi
+
+        desktop_vnc_log="$state_dir/desktop-x11vnc.log"
+        : >"$desktop_vnc_log"
+        /usr/bin/env \
+            DISPLAY="$desktop_display" \
+            XAUTHORITY="$selected_xauthority" \
+            /usr/bin/x11vnc \
+            -norc \
+            -display "$desktop_display" \
+            -auth "$selected_xauthority" \
+            -localhost \
+            -no6 \
+            -nopw \
+            -forever \
+            -shared \
+            -repeat \
+            -nobell \
+            -modtweak \
+            -xkb \
+            -add_keysyms \
+            -seldir recv \
+            -autoport 5922 \
+            >>"$desktop_vnc_log" 2>&1 &
+        desktop_x11vnc_pid=$!
+
+        for _ in {1..150}; do
+            if ! kill -0 "$desktop_x11vnc_pid" >/dev/null 2>&1; then
+                log 'The localhost VNC desktop relay exited during startup.'
+                return 1
+            fi
+            desktop_vnc_port="$(
+                /usr/bin/sed -n 's/^PORT=\([0-9][0-9]*\)$/\1/p' \
+                    "$desktop_vnc_log" | /usr/bin/tail -n 1
+            )"
+            if [[ "$desktop_vnc_port" =~ ^[0-9]+$ ]] &&
+               /usr/bin/ss -H -ltnp "sport = :$desktop_vnc_port" \
+                   2>/dev/null | /usr/bin/grep -q \
+                   "pid=$desktop_x11vnc_pid,"; then
+                log "Local VNC is relaying X11 $desktop_display on 127.0.0.1:$desktop_vnc_port."
+                return 0
+            fi
+            sleep 0.1
+        done
+
+        log 'The localhost VNC desktop relay did not become ready.'
+        return 1
+    fi
+
+    native_openssl_modules="$(
+        /usr/bin/openssl version -m | /usr/bin/sed -n \
+            's/^MODULESDIR: "\(.*\)"$/\1/p'
+    )"
+    if [[ -z "$native_openssl_modules" ||
+          ! -d "$native_openssl_modules" ]]; then
+        log 'Could not discover the native OpenSSL provider directory.'
+        return 1
+    fi
+
+    desktop_environment=(
+        "DBUS_SESSION_BUS_ADDRESS=$desktop_bus"
+        "DISPLAY=$desktop_display"
+        "OPENSSL_CONF=/etc/ssl/openssl.cnf"
+        "OPENSSL_MODULES=$native_openssl_modules"
+    )
+    if [[ "$use_backport_libei" == true ]]; then
+        desktop_environment+=("LD_LIBRARY_PATH=$libei_dir")
+    fi
+    if [[ -n "$desktop_wayland" ]]; then
+        desktop_environment+=("WAYLAND_DISPLAY=$desktop_wayland")
+    fi
+    if [[ -n "$desktop_session_type" ]]; then
+        desktop_environment+=("XDG_SESSION_TYPE=$desktop_session_type")
+    fi
+
+    # XRDP starts GNOME on a private session bus. The regular user unit runs
+    # on /run/user/$UID/bus and cannot see that shell, so launch GRD on the
+    # bus belonging to the desktop that is actually being shared.
+    if "${systemctl_user[@]}" is-active --quiet \
+        gnome-remote-desktop.service; then
+        grd_user_service_was_active=true
+    fi
+    "${systemctl_user[@]}" stop gnome-remote-desktop.service \
+        >/dev/null 2>&1 || true
+    configure_desktop_monitor_mode
+    /usr/bin/env "${desktop_environment[@]}" \
+        /usr/libexec/gnome-remote-desktop-daemon --rdp-port "$rdp_port" \
+        >>"$state_dir/gnome-remote-desktop.log" 2>&1 &
+    grd_pid=$!
+
+    for _ in {1..150}; do
+        if ! kill -0 "$grd_pid" >/dev/null 2>&1; then
+            log 'GNOME Desktop Sharing exited during startup.'
+            return 1
+        fi
+        if /usr/bin/ss -H -ltnp "sport = :$rdp_port" 2>/dev/null | \
+            /usr/bin/grep -q "pid=$grd_pid,"; then
+            log "GNOME Desktop Sharing is relaying $desktop_session_type ${desktop_display:-$desktop_wayland}."
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    log "GNOME Desktop Sharing did not open 127.0.0.1:$rdp_port."
+    return 1
+}
+
+start_x11_input_helper() {
+    local helper_display
+    local helper_kind
+    local -a injection_options=()
+    local selected_xauthority
+
+    active_keyboard_route="rdp"
+    x11_input_semantic_only=false
+    if [[ ! -x "$x11_input_helper" ]]; then
+        log 'The optional direct X11 keyboard helper is missing; retaining the RDP input route.'
+        return 0
+    fi
+
+    helper_display="$desktop_display"
+    selected_xauthority="$desktop_xauthority"
+    if [[ -z "$selected_xauthority" && -f "$HOME/.Xauthority" ]]; then
+        selected_xauthority="$HOME/.Xauthority"
+    fi
+    if [[ "$keyboard_route" != rdp &&
+          "$desktop_session_type" == x11 &&
+          -n "$helper_display" ]]; then
+        helper_kind=direct
+    elif [[ "$desktop_relay" == rdp &&
+            "$phone_text_mode" != keys &&
+            -n "$helper_display" &&
+            -r "$xauth_file" ]]; then
+        helper_kind=semantic-relay
+        x11_input_semantic_only=true
+        injection_options=(
+            --inject-display "$DISPLAY"
+            --inject-xauthority "$xauth_file"
+        )
+    else
+        if [[ "$keyboard_route" != rdp ]]; then
+            log "Direct X11 keyboard input is unavailable for the selected ${desktop_session_type:-unknown} desktop; retaining the RDP input route."
+        fi
+        return 0
+    fi
+    if ! /usr/bin/env DISPLAY="$helper_display" \
+        XAUTHORITY="$selected_xauthority" \
+        /usr/bin/xdpyinfo >/dev/null 2>&1; then
+        log 'The target desktop clipboard authorization could not be verified; retaining the RDP input route.'
+        x11_input_semantic_only=false
+        return 0
+    fi
+
+    rm -f "$x11_input_ready_file"
+    x11_input_token="$(/usr/bin/openssl rand -hex 32)"
+    /usr/bin/env \
+        DISPLAY="$helper_display" \
+        XAUTHORITY="$selected_xauthority" \
+        DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+        UURB_X11_INPUT_TOKEN="$x11_input_token" \
+        "$x11_input_helper" \
+        --ready-file "$x11_input_ready_file" \
+        --min-hold-ms "$physical_key_delay_ms" \
+        "${injection_options[@]}" \
+        >>"$state_dir/x11-input.log" 2>&1 &
+    x11_input_pid=$!
+
+    for _ in {1..50}; do
+        if [[ -s "$x11_input_ready_file" ]] && \
+           kill -0 "$x11_input_pid" >/dev/null 2>&1; then
+            read -r x11_input_port <"$x11_input_ready_file"
+            if [[ "$x11_input_port" =~ ^[1-9][0-9]{0,4}$ ]] && \
+               ((x11_input_port <= 65535)); then
+                if [[ "$helper_kind" == direct ]]; then
+                    active_keyboard_route="x11"
+                    log "Physical keyboard input uses direct X11 injection on $helper_display (minimum hold ${physical_key_delay_ms} ms)."
+                else
+                    log "Semantic phone text owns the physical clipboard on $helper_display and pastes through the private RDP relay."
+                fi
+                return 0
+            fi
+        fi
+        if ! kill -0 "$x11_input_pid" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    log 'The direct X11 keyboard helper did not become ready; retaining the RDP input route.'
+    kill "$x11_input_pid" >/dev/null 2>&1 || true
+    for _ in {1..10}; do
+        kill -0 "$x11_input_pid" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if kill -0 "$x11_input_pid" >/dev/null 2>&1; then
+        kill -KILL "$x11_input_pid" >/dev/null 2>&1 || true
+    fi
+    x11_input_pid=""
+    x11_input_port=""
+    x11_input_token=""
+    x11_input_semantic_only=false
+    rm -f "$x11_input_ready_file"
+}
+
+start_x11_clipboard_helper() {
+    local selected_xauthority
+
+    if [[ "$desktop_relay" != vnc ]]; then
+        return 0
+    fi
+    if [[ ! -x "$x11_clipboard_helper" ]]; then
+        log 'The optional one-way X11 clipboard helper is missing; retaining the existing clipboard behavior.'
+        return 0
+    fi
+    if [[ "$desktop_session_type" != x11 || -z "$desktop_display" ]]; then
+        log "One-way Mac clipboard forwarding requires the selected physical X11 desktop; selected ${desktop_session_type:-unknown}."
+        return 0
+    fi
+    selected_xauthority="$desktop_xauthority"
+    if [[ -z "$selected_xauthority" && -f "$HOME/.Xauthority" ]]; then
+        selected_xauthority="$HOME/.Xauthority"
+    fi
+    if ! /usr/bin/env DISPLAY="$desktop_display" \
+        XAUTHORITY="$selected_xauthority" \
+        /usr/bin/xdpyinfo >/dev/null 2>&1; then
+        log 'The target desktop clipboard authorization could not be verified; retaining the existing clipboard behavior.'
+        return 0
+    fi
+
+    rm -f "$x11_clipboard_ready_file"
+    x11_clipboard_token="$(/usr/bin/openssl rand -hex 32)"
+    /usr/bin/env \
+        DISPLAY="$desktop_display" \
+        XAUTHORITY="$selected_xauthority" \
+        UURB_X11_CLIPBOARD_TOKEN="$x11_clipboard_token" \
+        "$x11_clipboard_helper" --ready-file "$x11_clipboard_ready_file" \
+        >>"$state_dir/x11-clipboard.log" 2>&1 &
+    x11_clipboard_pid=$!
+
+    for _ in {1..50}; do
+        if [[ -s "$x11_clipboard_ready_file" ]] && \
+           kill -0 "$x11_clipboard_pid" >/dev/null 2>&1; then
+            read -r x11_clipboard_port <"$x11_clipboard_ready_file"
+            if [[ "$x11_clipboard_port" =~ ^[1-9][0-9]{0,4}$ ]] && \
+               ((x11_clipboard_port <= 65535)); then
+                log "One-way Wine-to-$desktop_display text clipboard helper is ready."
+                return 0
+            fi
+        fi
+        if ! kill -0 "$x11_clipboard_pid" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    log 'The optional one-way X11 clipboard helper did not become ready; retaining the existing clipboard behavior.'
+    kill "$x11_clipboard_pid" >/dev/null 2>&1 || true
+    x11_clipboard_pid=""
+    x11_clipboard_port=""
+    x11_clipboard_token=""
+    rm -f "$x11_clipboard_ready_file"
+}
+
+start_wine_clipboard_bridge() {
+    if [[ -z "$x11_clipboard_port" ||
+          ! -f "$wine_clipboard_bridge_exe" ]]; then
+        return 0
+    fi
+    /usr/bin/env \
+        "UURB_X11_CLIPBOARD_PORT=$x11_clipboard_port" \
+        "UURB_X11_CLIPBOARD_TOKEN=$x11_clipboard_token" \
+        /opt/wine-stable/bin/wine "$wine_clipboard_bridge_exe" \
+        >>"$state_dir/wine-clipboard-bridge.log" 2>&1 &
+    wine_clipboard_bridge_pid=$!
+    sleep 0.2
+    if ! kill -0 "$wine_clipboard_bridge_pid" >/dev/null 2>&1; then
+        log 'The optional Wine clipboard companion exited during startup; retaining the existing clipboard behavior.'
+        wine_clipboard_bridge_pid=""
+        return 0
+    fi
+    log 'Mac/UU clipboard forwarding is active: GameViewer CF_UNICODETEXT -> physical X11 only.'
+}
+
+install_terminal_conpty_shim() {
+    # UU 4.39+ opens terminals through the bundled Microsoft conpty.dll, whose
+    # host cannot start under Wine. Replace only that original (kept as the
+    # vendor copy) with the shim joining conpty_bridge to the PTY broker; an
+    # unknown conpty.dll is left alone so terminal support stays optional.
+    [[ -f "$terminal_shim_compat" && -f "$terminal_conpty_dll" ]] || return 1
+    if /usr/bin/cmp -s "$terminal_conpty_dll" "$terminal_shim_compat"; then
+        return 0
+    fi
+    if ! LC_ALL=C /usr/bin/grep -aq 'ConptyCreatePseudoConsoleAsUser' \
+            "$terminal_conpty_dll" 2>/dev/null; then
+        log 'bin/conpty.dll is not the Microsoft original; leaving it untouched.'
+        return 1
+    fi
+    /bin/cp -p "$terminal_conpty_dll" "${terminal_conpty_vendor}.tmp" &&
+        chmod 600 "${terminal_conpty_vendor}.tmp" &&
+        mv -f -- "${terminal_conpty_vendor}.tmp" "$terminal_conpty_vendor" &&
+        /usr/bin/install -m 0644 "$terminal_shim_compat" \
+            "${terminal_conpty_dll}.tmp" &&
+        mv -f -- "${terminal_conpty_dll}.tmp" "$terminal_conpty_dll"
+}
+
+install_terminal_mux_proxy() {
+    # psmux resolves plain `powershell` from system32; put the proxy on that
+    # path too, replacing only Wine's builtin placeholder (kept as the
+    # .uurb-wine copy) or an earlier identical proxy.
+    /usr/bin/install -d -m 0755 "$mux_powershell_dir" || return 1
+    if /usr/bin/cmp -s "$mux_proxy_exe" "$terminal_proxy_compat"; then
+        return 0
+    fi
+    if [[ -f "$mux_proxy_exe" ]] && ! /usr/bin/head -c 128 "$mux_proxy_exe" |
+            /usr/bin/grep -aq 'Wine builtin DLL'; then
+        log 'The WindowsPowerShell path holds a non-Wine powershell; psmux terminals stay unsupported.'
+        return 1
+    fi
+    if [[ -f "$mux_proxy_exe" ]]; then
+        /bin/cp -p "$mux_proxy_exe" "${mux_proxy_placeholder}.tmp" &&
+            chmod 600 "${mux_proxy_placeholder}.tmp" &&
+            mv -f -- "${mux_proxy_placeholder}.tmp" "$mux_proxy_placeholder"
+    fi
+    /usr/bin/install -m 0644 "$terminal_proxy_compat" "${mux_proxy_exe}.tmp" &&
+        mv -f -- "${mux_proxy_exe}.tmp" "$mux_proxy_exe"
+}
+
+start_terminal_bridge() {
+    local config_temporary
+    local mux_runtime=false
+
+    if [[ ! -x "$terminal_bridge_helper" ||
+          ! -f "$terminal_proxy_compat" ||
+          ! -f "$terminal_proxy_exe" ]] ||
+       ! /usr/bin/cmp -s "$terminal_proxy_compat" "$terminal_proxy_exe"; then
+        log 'The native Ubuntu terminal compatibility bridge is missing or inconsistent.'
+        return 1
+    fi
+    if install_terminal_conpty_shim; then
+        log 'The conpty.dll shim is active; UU terminals open through the PTY broker.'
+    else
+        log 'The conpty.dll shim is inactive; UU terminals stay unavailable.'
+    fi
+    if install_terminal_mux_proxy; then
+        mux_runtime=true
+    else
+        log 'The psmux PowerShell proxy is inactive; psmux-path terminals stay unsupported.'
+    fi
+    config_temporary="${terminal_config_file}.$$.tmp"
+    rm -f \
+        "$terminal_ready_file" \
+        "$terminal_config_file" \
+        "$config_temporary"
+    terminal_bridge_token="$(/usr/bin/openssl rand -hex 32)"
+    /usr/bin/env \
+        UURB_TERMINAL_BRIDGE_TOKEN="$terminal_bridge_token" \
+        "$terminal_bridge_helper" --ready-file "$terminal_ready_file" \
+        >>"$state_dir/terminal-bridge.log" 2>&1 &
+    terminal_bridge_pid=$!
+
+    for _ in {1..50}; do
+        if [[ -s "$terminal_ready_file" ]] && \
+           kill -0 "$terminal_bridge_pid" >/dev/null 2>&1; then
+            read -r terminal_bridge_port <"$terminal_ready_file"
+            if [[ "$terminal_bridge_port" =~ ^[1-9][0-9]{0,4}$ ]] && \
+               ((terminal_bridge_port <= 65535)); then
+                if ! (
+                    umask 077
+                    printf 'version=1\nport=%s\ntoken=%s\n' \
+                        "$terminal_bridge_port" \
+                        "$terminal_bridge_token" >"$config_temporary"
+                ) || ! chmod 600 "$config_temporary" ||
+                   ! mv -f -- "$config_temporary" "$terminal_config_file"; then
+                    log 'The UU terminal runtime handoff could not be written.'
+                    break
+                fi
+                export UURB_TERMINAL_BRIDGE_PORT="$terminal_bridge_port"
+                export UURB_TERMINAL_BRIDGE_TOKEN="$terminal_bridge_token"
+                if [[ "$mux_runtime" == true ]]; then
+                    if ! (
+                        umask 077
+                        printf 'version=1\nport=%s\ntoken=%s\n' \
+                            "$terminal_bridge_port" \
+                            "$terminal_bridge_token" \
+                            >"${mux_config_file}.$$.tmp"
+                    ) || ! mv -f -- "${mux_config_file}.$$.tmp" "$mux_config_file"; then
+                        log 'The psmux PowerShell runtime handoff could not be written.'
+                    fi
+                fi
+                log "UU terminal requests use the authenticated native Ubuntu PTY bridge on loopback port $terminal_bridge_port."
+                return 0
+            fi
+        fi
+        if ! kill -0 "$terminal_bridge_pid" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    log 'The native Ubuntu terminal bridge did not become ready.'
+    kill "$terminal_bridge_pid" >/dev/null 2>&1 || true
+    terminal_bridge_pid=""
+    terminal_bridge_port=""
+    terminal_bridge_token=""
+    rm -f \
+        "$terminal_ready_file" \
+        "$terminal_config_file" \
+        "$config_temporary"
+    return 1
+}
+
+mkdir -p \
+    "$state_dir" \
+    "$runtime_dir" \
+    "$WINEPREFIX/drive_c/users/$bridge_user/Temp"
+chmod 700 "$runtime_dir"
+
+if [[ ! -x "$wine_stop_bin" ]]; then
+    log 'The prefix-scoped Wine cleanup helper is missing.'
+    exit 1
+fi
+
+if ! start_desktop_relay; then
+    exit 1
+fi
+if ! align_resolution_at_startup; then
+    exit 1
+fi
+log "Using private display $DISPLAY at $resolution and RDP port $rdp_port."
+if [[ "$cursor_guard_setting" == on ]]; then
+    resolve_cursor_size
+fi
+if ! start_terminal_bridge; then
+    exit 1
+fi
+
+touch "$xauth_file"
+chmod 600 "$xauth_file"
+/usr/bin/xauth -f "$xauth_file" add "$DISPLAY" . "$(/usr/bin/mcookie)"
+export XAUTHORITY="$xauth_file"
+
+private_max_resolution="$resolution"
+native_display_modes=false
+if [[ "$desktop_relay" == rdp &&
+      "$resolution" =~ ^(1280x720|1920x1080|2560x1440|3840x2160)$ ]]; then
+    private_max_resolution=3840x2160
+    native_display_modes=true
+fi
+/usr/bin/Xvfb "$DISPLAY" \
+    -screen 0 "${private_max_resolution}x24" \
+    -dpi 96 \
+    -nolisten tcp \
+    -noreset \
+    -auth "$xauth_file" \
+    >>"$state_dir/xvfb.log" 2>&1 &
+xvfb_pid=$!
+
+x_ready=false
+for _ in {1..100}; do
+    if /usr/bin/xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+        x_ready=true
+        break
+    fi
+    sleep 0.1
+done
+
+if [[ "$x_ready" != true ]]; then
+    log 'The private X11 display did not become ready.'
+    exit 1
+fi
+private_display_tmp="$private_display_file.$$"
+printf '%s\n' "$DISPLAY" >"$private_display_tmp"
+chmod 0600 "$private_display_tmp"
+mv "$private_display_tmp" "$private_display_file"
+
+/usr/bin/openbox >>"$state_dir/openbox.log" 2>&1 &
+openbox_pid=$!
+if [[ "$native_display_modes" == true ]]; then
+    if ! /usr/bin/python3 "$wine_prefix/compat/uu-display-modes.py" register "$resolution" \
+        >>"$state_dir/display-modes.log" 2>&1; then
+        log 'Genuine private display mode registration failed before Wine startup.'
+        exit 1
+    fi
+fi
+if [[ "$input_route" == rdp-public ]]; then
+    for required in "$full_input_plugin" "$input_broker_probe_exe" "$full_ready_helper" "$manual_plane_helper"; do
+        [[ -f "$required" && ! -L "$required" && -r "$required" ]] || { log "Full input/Manual artifact missing: $required"; exit 1; }
+    done
+    full_session_dir="$(/usr/bin/mktemp -d "$runtime_dir/full-session.XXXXXXXX")"
+    full_ready_dir="$(/usr/bin/mktemp -d "$WINEPREFIX/drive_c/users/$bridge_user/Temp/full-ready.XXXXXXXX")"
+    chmod 0700 "$full_ready_dir"
+    chmod 0700 "$full_session_dir"
+    rm -f -- "$manual_plane_ready" "$manual_plane_ready.failure"
+    full_nonce="$(/usr/bin/openssl rand -hex 32)"
+    export UURB_FULL_PIPE="\\\\.\\pipe\\uurb-full-$full_nonce"
+    export UURB_FULL_BOOTSTRAP="$(/usr/bin/openssl rand -hex 32)"
+    export UURB_FULL_READY_NONCE="$full_nonce"
+    # Construct exact C: paths before ANY Wine/service process starts. The
+    # actual winepath result is checked later, without retroactive inheritance.
+    export UURB_INPUT_SOURCE_EXE="C:\\Program Files\\Netease\\GameViewer\\bin\\GameViewerServer.exe"
+    export UURB_FULL_BROKER_READY="C:\\users\\$bridge_user\\Temp\\${full_ready_dir##*/}\\broker.ready"
+    export UURB_FULL_SDL_READY="C:\\users\\$bridge_user\\Temp\\${full_ready_dir##*/}\\sdl.ready"
+    public_input_log_windows="C:\\users\\$bridge_user\\AppData\\Local\\Temp\\uu-input-bridge.log"
+    rm -f -- "$full_config_path"
+    /usr/bin/python3 "$manual_plane_helper" --display "$DISPLAY" \
+        --prefix "$WINEPREFIX" --x-pid "$xvfb_pid" \
+        --x-start "$(/usr/bin/awk '{print $22}' "/proc/$xvfb_pid/stat")" \
+        --parent "$$" --nonce "$full_nonce" --ready "$manual_plane_ready" \
+        --target "$full_session_dir/sdl-bound.json" \
+        --prefix-stopped "$full_session_dir/prefix-stopped.json" --fps "$plane_fps" \
+        >>"$state_dir/manual-plane.log" 2>&1 &
+    manual_plane_pid=$!
+    plane_started=false
+    for _ in {1..100}; do
+        if /usr/bin/python3 "$manual_plane_helper" --check-redirected \
+            --display "$DISPLAY" --prefix "$WINEPREFIX" --parent "$$" \
+            --nonce "$full_nonce" --x-pid "$xvfb_pid" \
+            --x-start "$(/usr/bin/awk '{print $22}' "/proc/$xvfb_pid/stat")" \
+            --expected-owner "$manual_plane_pid" --ready "$manual_plane_ready" \
+            >/dev/null 2>&1; then plane_started=true; break; fi
+        [[ ! -e "$manual_plane_ready.failure" ]] || break
+        kill -0 "$manual_plane_pid" 2>/dev/null || break
+        sleep .05
+    done
+    [[ "$plane_started" == true ]] || { log 'Manual root owner did not start.'; exit 1; }
+fi
+start_x11_input_helper
+start_x11_clipboard_helper
+
+if [[ "$desktop_relay" == rdp && ! -f "$freerdp_exe" ]]; then
+    log 'The Windows FreeRDP client is missing from the Wine prefix.'
+    exit 1
+fi
+if [[ "$desktop_relay" == vnc && ! -x /usr/bin/vncviewer ]]; then
+    log 'The native VNC viewer is missing.'
+    exit 1
+fi
+
+if [[ ! -f "$input_bridge_dll" || ! -f "$input_broker_exe" ||
+      ! -f "$input_injector_exe" || ! -f "$service_control_exe" ||
+      ! -f "$wine_clipboard_bridge_exe" || ! -x "$x11_clipboard_helper" ||
+      ! -x "$terminal_bridge_helper" ||
+      ! -f "$terminal_proxy_compat" ||
+      ! -f "$terminal_proxy_exe" ]] ||
+   ! /usr/bin/cmp -s "$terminal_proxy_compat" "$terminal_proxy_exe"; then
+    log 'The UU input or terminal compatibility bridge is missing from the Wine prefix.'
+    exit 1
+fi
+if [[ "$cursor_guard_setting" == on && ! -f "$cursor_guard_dll" ]]; then
+    log 'The optional UU cursor guard is missing from the Wine prefix.'
+    exit 1
+fi
+
+select_network_interface
+wine_host_environment=(/usr/bin/env)
+if [[ -n "$active_network_interface" ]]; then
+    if [[ -f "$network_filter" ]]; then
+        wine_host_environment+=(
+            "UURB_NETWORK_INTERFACE=$active_network_interface"
+            "LD_PRELOAD=$network_filter"
+        )
+    else
+        log 'The optional UU network filter is missing; preserving the unfiltered adapter list.'
+        active_network_interface=""
+    fi
+fi
+
+if [[ "$desktop_relay" == rdp ]]; then
+    password="$(
+        /usr/bin/env DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+            /usr/bin/secret-tool lookup service uu-desktop-bridge \
+            username "$bridge_user" || true
+    )"
+    if [[ -z "$password" ]]; then
+        log 'The RDP bridge password is missing from the login keyring.'
+        exit 1
+    fi
+
+    tls_cert="$(/usr/bin/gsettings get \
+        org.gnome.desktop.remote-desktop.rdp tls-cert)"
+    tls_cert="${tls_cert#\'}"
+    tls_cert="${tls_cert%\'}"
+    if [[ ! -f "$tls_cert" ]]; then
+        log 'The configured GNOME RDP TLS certificate is missing.'
+        exit 1
+    fi
+    tls_fingerprint="$(
+        /usr/bin/openssl x509 -in "$tls_cert" -outform DER | \
+            /usr/bin/sha256sum | /usr/bin/awk '{print $1}'
+    )"
+    cert_option="/cert:fingerprint:sha256:$tls_fingerprint"
+fi
+
+/usr/bin/timeout --kill-after=1s 5s \
+    /usr/bin/env WINEPREFIX="$WINEPREFIX" \
+    /opt/wine-stable/bin/wineserver -k >/dev/null 2>&1 || true
+/usr/bin/timeout --kill-after=1s 5s \
+    /usr/bin/env WINEPREFIX="$WINEPREFIX" \
+    /opt/wine-stable/bin/wineserver -w >/dev/null 2>&1 || true
+
+"${wine_host_environment[@]}" "$compat_dir/winlogon.exe" \
+    >>"$state_dir/winlogon.log" 2>&1 &
+winlogon_pid=$!
+
+uu_ready=false
+for _ in {1..120}; do
+    if wine_prefix_process_pid 'GameViewerServer\.exe' >/dev/null && \
+       wine_prefix_process_pid 'GameViewerHealthd' >/dev/null; then
+        uu_ready=true
+        break
+    fi
+    sleep 0.25
+done
+
+if [[ "$uu_ready" != true ]]; then
+    log 'UU Remote background processes did not become ready.'
+    exit 1
+fi
+
+if [[ "$input_route" == rdp-public ]]; then
+    [[ "$(/opt/wine-stable/bin/winepath -w "$uu_app_dir/bin/GameViewerServer.exe")" == "$UURB_INPUT_SOURCE_EXE" &&
+       "$(/opt/wine-stable/bin/winepath -w "$full_ready_dir/broker.ready")" == "$UURB_FULL_BROKER_READY" &&
+       "$(/opt/wine-stable/bin/winepath -w "$full_ready_dir/sdl.ready")" == "$UURB_FULL_SDL_READY" ]] || {
+        log 'Actual Wine C: executable/readiness mapping differs from startup binding.'
+        exit 1
+    }
+fi
+broker_environment=(/usr/bin/env)
+if [[ -n "$x11_input_port" ]]; then
+    broker_environment+=(
+        "UURB_X11_INPUT_PORT=$x11_input_port"
+        "UURB_X11_INPUT_TOKEN=$x11_input_token"
+    )
+    if [[ "$x11_input_semantic_only" == true ]]; then
+        broker_environment+=("UURB_X11_INPUT_SEMANTIC_ONLY=1")
+    fi
+fi
+"${broker_environment[@]}" /opt/wine-stable/bin/wine "$input_broker_exe" \
+    >>"$state_dir/input-broker.log" 2>&1 &
+input_broker_pid=$!
+
+sleep 0.2
+if ! kill -0 "$input_broker_pid" >/dev/null 2>&1; then
+    log 'The UU input broker exited during startup.'
+    exit 1
+fi
+
+if [[ "$input_route" == rdp-public ]]; then
+    broker_windows_exe="$(/opt/wine-stable/bin/winepath -w "$input_broker_exe")"
+    broker_ready_identity="$(/usr/bin/python3 "$full_ready_helper" \
+        --ready "$full_ready_dir/broker.ready" --nonce "$full_nonce" --role broker \
+        --exe "$input_broker_exe" --exe-windows "$broker_windows_exe" \
+        --prefix "$WINEPREFIX" --display "$DISPLAY" --parent "$$" \
+        --output "$full_session_dir/broker-bound.json" --timeout 15)" || exit 1
+    read -r UURB_FULL_PEER_PID UURB_FULL_PEER_START broker_linux_pid broker_linux_start <<<"$broker_ready_identity"
+    export UURB_FULL_PEER_PID UURB_FULL_PEER_START
+    /usr/bin/python3 "$full_ready_helper" --write-public-config \
+        --ready "$full_ready_dir/broker.ready" --role broker --nonce "$full_nonce" \
+        --exe "$input_broker_exe" --exe-windows "$broker_windows_exe" \
+        --prefix "$WINEPREFIX" --display "$DISPLAY" --parent "$$" \
+        --bootstrap "$UURB_FULL_BOOTSTRAP" --broker-ready-windows "$UURB_FULL_BROKER_READY" \
+        --source-windows "$UURB_INPUT_SOURCE_EXE" --log-windows "$public_input_log_windows" \
+        --output "$full_config_path" || exit 1
+fi
+
+input_bridge_windows_path="$(
+    /opt/wine-stable/bin/winepath -w "$input_bridge_dll"
+)"
+preserve_cursor_guard_failure() {
+    local phase="$1"
+    local captured_at
+    local evidence_dir
+    local source
+    local log_name
+
+    captured_at="$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if ! evidence_dir="$(/usr/bin/mktemp -d \
+            "$state_dir/cursor-guard-failure.XXXXXXXX")"; then
+        log "Cursor guard evidence could not be saved: time=$captured_at phase=$phase."
+        return 1
+    fi
+    (
+        umask 077
+        printf 'time=%s\nphase=%s\nrelay_log=%s\nreader_log=%s\nmax_bytes_per_log=65536\n' \
+            "$captured_at" "$phase" "$cursor_guard_log" \
+            "$cursor_reader_guard_log" >"$evidence_dir/summary.txt"
+        for source in "$cursor_guard_log" "$cursor_reader_guard_log" \
+                "$state_dir/cursor-guard-injector.log" \
+                "$state_dir/cursor-reader-guard-injector.log"; do
+            if [[ -f "$source" && ! -L "$source" ]]; then
+                case "$source" in
+                    "$cursor_guard_log")
+                        log_name=relay-guard.log ;;
+                    "$cursor_reader_guard_log")
+                        log_name=reader-guard.log ;;
+                    *)
+                        log_name="${source##*/}" ;;
+                esac
+                /usr/bin/tail -c 65536 "$source" >"$evidence_dir/$log_name" || exit 1
+            else
+                printf 'missing=%s\n' "$source" >>"$evidence_dir/summary.txt"
+            fi
+        done
+    ) || return 1
+    log "Cursor guard failure evidence saved: time=$captured_at phase=$phase path=$evidence_dir."
+}
+
+inject_input_bridge() {
+    if ! /opt/wine-stable/bin/wine "$input_injector_exe" \
+        "$input_bridge_windows_path" \
+        >>"$state_dir/input-injector.log" 2>&1; then
+        log 'Could not inject the UU input compatibility bridge.'
+        return 1
+    fi
+}
+
+initialize_server_compatibility() {
+    local cursor_reader_guard_ready=false
+
+    if [[ "$input_route" != rdp-public || "$public_input_ready" == true ]]; then
+        inject_input_bridge || return 1
+    fi
+    [[ "$cursor_guard_setting" == on ]] || return 0
+    rm -f "$cursor_reader_guard_log"
+    if ! /opt/wine-stable/bin/wine "$input_injector_exe" \
+        "$cursor_guard_windows_path" GameViewerServer.exe \
+        >>"$state_dir/cursor-reader-guard-injector.log" 2>&1; then
+        log 'Could not inject the UU cursor reader guard.'
+        preserve_cursor_guard_failure reader-injection || true
+        return 1
+    fi
+    cursor_reader_guard_ready=false
+    for _ in {1..100}; do
+        if grep -q 'UU cursor reader guard active' \
+            "$cursor_reader_guard_log" 2>/dev/null; then
+            cursor_reader_guard_ready=true
+            break
+        fi
+        if grep -q 'UU cursor reader guard initialization failed' \
+            "$cursor_reader_guard_log" 2>/dev/null; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$cursor_reader_guard_ready" != true ]]; then
+        log 'The UU cursor reader guard did not initialize.'
+        preserve_cursor_guard_failure reader-readiness || true
+        return 1
+    fi
+}
+
+if [[ "$cursor_guard_setting" == on ]]; then
+    cursor_guard_windows_path="$(
+        /opt/wine-stable/bin/winepath -w "$cursor_guard_dll"
+    )"
+fi
+if ! initialize_server_compatibility; then
+    exit 1
+fi
+start_wine_clipboard_bridge
+server_pid="$(wine_prefix_process_pid 'GameViewerServer\.exe')"
+
+relay_ready=false
+if [[ "$desktop_relay" == rdp ]]; then
+    freerdp_mouse_options=()
+    freerdp_full_options=()
+    [[ "$input_route" != rdp-public ]] || freerdp_full_options+=(/dvc:uurb-full-input)
+    if [[ "$cursor_guard_setting" == on ]]; then
+        freerdp_mouse_options+=(/mouse:relative:off,grab:off)
+    fi
+    /opt/wine-stable/bin/wine "$freerdp_exe" \
+        "/v:127.0.0.1:$rdp_port" \
+        "/u:$bridge_user" \
+        /from-stdin:force \
+        "$cert_option" \
+        /sspi-module:'C:\Program Files\FreeRDP\winpr-sspi-shim.dll' \
+        /auth-pkg-list:'none,ntlm' \
+        /network:auto \
+        "/size:$resolution" \
+        /smart-sizing:on \
+        /bpp:32 \
+        /gdi:sw \
+        /audio-mode:2 \
+        "${freerdp_mouse_options[@]}" \
+        "${freerdp_full_options[@]}" \
+        /prevent-session-lock:180 \
+        /t:Ubuntu-Desktop-Relay \
+        +f \
+        -toggle-fullscreen \
+        -decorations \
+        -suppress-output \
+        +clipboard \
+        +auto-reconnect \
+        /auto-reconnect-max-retries:0 \
+        /log-level:WARN \
+        <<<"$password" >>"$state_dir/freerdp.log" 2>&1 &
+    freerdp_pid=$!
+    unset password
+
+    for _ in {1..300}; do
+        if /usr/bin/xdotool search --name Ubuntu-Desktop-Relay \
+            >/dev/null 2>&1; then
+            relay_ready=true
+            break
+        fi
+        # Wine's Unix launcher may exit after handing the Windows process to
+        # wineserver. Its lifetime does not represent the client lifetime.
+        sleep 0.1
+    done
+    if [[ "$relay_ready" != true ]]; then
+        log 'FreeRDP did not create the Ubuntu desktop relay window.'
+        exit 1
+    fi
+
+    if [[ "$cursor_guard_setting" == on ]]; then
+        rm -f "$cursor_guard_log"
+        if ! /opt/wine-stable/bin/wine "$input_injector_exe" \
+            "$cursor_guard_windows_path" sdl-freerdp.exe \
+            >>"$state_dir/cursor-guard-injector.log" 2>&1; then
+            log 'Could not inject the FreeRDP cursor guard.'
+            preserve_cursor_guard_failure relay-injection || true
+            exit 1
+        fi
+        cursor_guard_ready=false
+        for _ in {1..100}; do
+            if grep -q 'UU relay cursor guard active' \
+                "$cursor_guard_log" 2>/dev/null; then
+                cursor_guard_ready=true
+                break
+            fi
+            if grep -q 'UU cursor guard initialization failed' \
+                "$cursor_guard_log" 2>/dev/null; then
+                break
+            fi
+            sleep 0.05
+        done
+        if [[ "$cursor_guard_ready" != true ]]; then
+            log 'The FreeRDP cursor guard did not initialize.'
+            preserve_cursor_guard_failure relay-readiness || true
+            exit 1
+        fi
+    fi
+
+    relay_window_id="$(
+        /usr/bin/xdotool search --onlyvisible \
+            --name '^Ubuntu-Desktop-Relay$' 2>/dev/null \
+            | /usr/bin/tail -n 1
+    )"
+else
+    desktop_vnc_display=$((desktop_vnc_port - 5900))
+    # Terminal-only / headless deployment: upstream tunes these flags for
+    # RealVNC Viewer, which is not obtainable unattended. Ubuntu's
+    # tigervnc-viewer owns /usr/bin/vncviewer, so use its equivalent
+    # parameter set; clipboard relaying (AcceptClipboard/SendClipboard)
+    # is on by default and SendPrimary=0 keeps upstream semantics.
+    /usr/bin/env \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null \
+        /usr/bin/vncviewer \
+        -FullScreen=1 \
+        -Shared=1 \
+        -AcceptClipboard=0 \
+        -SendPrimary=0 \
+        -RemoteResize=0 \
+        "127.0.0.1:$desktop_vnc_display" \
+        >>"$state_dir/vncviewer-relay.log" 2>&1 &
+    vncviewer_pid=$!
+
+    for _ in {1..300}; do
+        relay_window_id="$(
+            {
+                /usr/bin/xdotool search --onlyvisible \
+                    --pid "$vncviewer_pid" \
+                    2>/dev/null || true
+            } | /usr/bin/tail -n 1
+        )"
+        if [[ -n "$relay_window_id" ]]; then
+            relay_ready=true
+            break
+        fi
+        if ! kill -0 "$vncviewer_pid" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ "$relay_ready" != true ]]; then
+        log 'The VNC viewer did not create the Ubuntu desktop relay window.'
+        exit 1
+    fi
+fi
+
+if [[ -z "$relay_window_id" ]]; then
+    log 'Could not identify the Ubuntu desktop relay window.'
+    exit 1
+fi
+if [[ "$input_route" == rdp-public ]]; then
+    sdl_windows_exe="$(/opt/wine-stable/bin/winepath -w "$freerdp_exe")"
+    sdl_ready_identity="$(/usr/bin/python3 "$full_ready_helper" \
+        --ready "$full_ready_dir/sdl.ready" --nonce "$full_nonce" --role sdl \
+        --exe "$freerdp_exe" --exe-windows "$sdl_windows_exe" \
+        --prefix "$WINEPREFIX" --display "$DISPLAY" --parent "$$" \
+        --output "$full_session_dir/sdl-bound.json" --timeout 15)" || exit 1
+    read -r sdl_windows_pid sdl_windows_start full_sdl_linux_pid full_sdl_linux_start <<<"$sdl_ready_identity"
+    manual_active=false
+    for _ in {1..100}; do
+        if /usr/bin/python3 "$manual_plane_helper" --check-ready \
+            --display "$DISPLAY" --prefix "$WINEPREFIX" --parent "$$" \
+            --ready "$manual_plane_ready" >/dev/null 2>&1; then
+            manual_active=true; break
+        fi
+        [[ ! -e "$manual_plane_ready.failure" ]] || break
+        kill -0 "$manual_plane_pid" 2>/dev/null || break
+        sleep .05
+    done
+    [[ "$manual_active" == true ]] || { log 'Manual owner did not bind actual SDL viewport.'; exit 1; }
+    # One read-only probe before the UU physical DLL takes the single broker
+    # pipe. Never probe it periodically while that long-lived client owns it.
+    if ! /usr/bin/timeout --kill-after=1s 5s /opt/wine-stable/bin/wine \
+        "$input_broker_probe_exe" >>"$state_dir/full-input-probe.log" 2>&1; then
+        log 'Actual public RDP input capabilities/configuration are not ready.'
+        exit 1
+    fi
+    # The strict DLL-directory current-session config avoids assuming SCM
+    # environment inheritance. Fresh actual hooks log is still mandatory.
+    /usr/bin/python3 "$full_ready_helper" --fresh-public-log \
+        --prefix "$WINEPREFIX" --parent "$$" --nonce "$full_nonce" \
+        --output "$public_input_log" --archive "$full_session_dir/input-hooks-before.log" || exit 1
+    public_input_ready=true
+    inject_input_bridge || exit 1
+    public_hooks_active=false
+    for _ in {1..100}; do
+        if /usr/bin/grep -Eq 'UU public session config accepted; source PID=[1-9][0-9]* FILETIME=[1-9][0-9]*' \
+                "$public_input_log" 2>/dev/null &&
+           /usr/bin/grep -q 'UU public input LOCAL wrapper state hooks active' "$public_input_log" &&
+           /usr/bin/grep -q 'UU SendInput bridge active' "$public_input_log" &&
+           /usr/bin/grep -q 'UU Wine event-log compatibility active' "$public_input_log"; then
+            public_hooks_active=true; break
+        fi
+        sleep .05
+    done
+    [[ "$public_hooks_active" == true ]] || {
+        log 'Actual audited server did not activate the public input route; SCM environment/configuration is not proven.'
+        exit 1
+    }
+else
+    /usr/bin/xdotool windowactivate --sync "$relay_window_id" >/dev/null 2>&1 || true
+fi
+
+bootstrap_account() {
+    /opt/wine-stable/bin/wine "$service_control_exe" \
+        GameViewerService 133 \
+        >>"$state_dir/service-control.log" 2>&1 || true
+    LIBGL_ALWAYS_SOFTWARE=1 /opt/wine-stable/bin/wine start /unix "$uu_app_dir/GameViewer.exe" \
+        >>"$state_dir/client-bootstrap.log" 2>&1 || true
+
+    # Keep the layered Wine/Qt management window mapped. Minimizing it while
+    # its top-level windows are still being replaced can raise BadWindow,
+    # terminate the GUI IPC client, and make the server destroy its room.
+    # The relay focus supervisor safely keeps this window behind the desktop.
+    sleep 1
+    if [[ "$input_route" != rdp-public ]]; then
+        /usr/bin/xdotool windowactivate --sync "$relay_window_id" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+# UU's GUI sends the account-login IPC message that makes the background
+# server visible to other devices. Let it exit normally: forcibly closing it
+# also asks the server to exit.
+bootstrap_account
+
+supervise_server() {
+    local last_pid="$1"
+    local last_starttime=""
+    local candidate
+    local candidate_starttime
+    local candidate_relay_window_id
+    local current_default_interface
+    local active_window_id
+    local focus_checks=0
+    local grd_fd_count
+    local health_checks=0
+    local missing_checks=0
+    local network_route_checks=0
+    local current_desktop_resolution
+    local pending_resolution=""
+    local pending_resolution_checks=0
+    local resolution_checks=0
+    local resolution_grace_checks=240
+    local monitor_checks=0
+    local monitor_transition_checks=0
+    local current_monitor_state
+    local current_monitor_mode
+    local expected_monitor_mode
+
+    if wine_process_identity "$last_pid"; then
+        last_starttime="$wine_process_starttime"
+    fi
+    while true; do
+        if [[ "$input_route" == rdp-public ]] &&
+           { [[ -e "$manual_plane_ready.failure" ]] || ! kill -0 "$manual_plane_pid" 2>/dev/null; }; then
+            log 'Manual desktop owner failed; restarting the complete protected bridge.'
+            return 1
+        fi
+        candidate=""
+        candidate_starttime=""
+        if [[ -n "$last_starttime" ]] && wine_process_identity "$last_pid" &&
+           [[ "$wine_process_starttime" == "$last_starttime" ]]; then
+            candidate="$last_pid"
+            candidate_starttime="$last_starttime"
+        else
+            candidate="$(wine_prefix_process_pid 'GameViewerServer\.exe' || true)"
+            if [[ -n "$candidate" ]] && wine_process_identity "$candidate"; then
+                candidate_starttime="$wine_process_starttime"
+            else
+                candidate=""
+            fi
+        fi
+        if [[ -z "$candidate" ]]; then
+            missing_checks=$((missing_checks + 1))
+            if ((missing_checks >= 40)); then
+                log 'UU server was absent for 10 seconds; restarting the bridge.'
+                return 1
+            fi
+        else
+            missing_checks=0
+        fi
+        if [[ -n "$candidate" && ( "$candidate" != "$last_pid" ||
+              "$candidate_starttime" != "$last_starttime" ) ]]; then
+            sleep 0.25
+            if initialize_server_compatibility; then
+                last_pid="$candidate"
+                last_starttime="$candidate_starttime"
+                log "Re-injected UU server process $candidate."
+                bootstrap_account
+            else
+                log "Could not re-inject UU server process $candidate."
+                return 1
+            fi
+        fi
+        focus_checks=$((focus_checks + 1))
+        if ((focus_checks >= 4)); then
+            focus_checks=0
+            if [[ "$input_route" == rdp-public ]] &&
+               ! /usr/bin/python3 "$manual_plane_helper" --check-ready \
+                    --display "$DISPLAY" --prefix "$WINEPREFIX" --parent "$$" \
+                    --ready "$manual_plane_ready" >/dev/null 2>&1; then
+                log 'Manual owner/SDL repaint lost readiness; restarting the complete bridge.'
+                return 1
+            fi
+            # RealVNC may replace its initial top-level window when it enters
+            # full-screen mode. Refresh the ID before focusing so an obsolete
+            # startup ID cannot leave UU's management window over the relay.
+            if [[ "$desktop_relay" == vnc ]]; then
+                candidate_relay_window_id="$(
+                    {
+                        /usr/bin/xdotool search --onlyvisible \
+                            --pid "$vncviewer_pid" \
+                            --name '^127\.0\.0\.1:.* - RealVNC Viewer$' \
+                            2>/dev/null || true
+                    } | /usr/bin/tail -n 1
+                )"
+                if [[ -n "$candidate_relay_window_id" ]]; then
+                    relay_window_id="$candidate_relay_window_id"
+                fi
+            fi
+            active_window_id="$(
+                /usr/bin/xdotool getactivewindow 2>/dev/null || true
+            )"
+            if [[ "$input_route" != rdp-public && ! -e "$console_focus_file" && \
+                  -n "$active_window_id" && \
+                  "$active_window_id" != "$relay_window_id" ]]; then
+                /usr/bin/xdotool windowactivate "$relay_window_id" \
+                    >/dev/null 2>&1 || true
+            fi
+        fi
+        health_checks=$((health_checks + 1))
+        if ((grd_fd_restart_threshold > 0 && health_checks >= 40)); then
+            health_checks=0
+            if [[ -d "/proc/$grd_pid/fd" ]]; then
+                grd_fd_count="$(
+                    /usr/bin/find "/proc/$grd_pid/fd" -maxdepth 1 \
+                        -type l -printf '.\n' 2>/dev/null | /usr/bin/wc -l
+                )"
+                if ((grd_fd_count >= grd_fd_restart_threshold)); then
+                    log "GNOME Remote Desktop reached $grd_fd_count file descriptors; restarting the relay before exhaustion."
+                    return 1
+                fi
+            fi
+        fi
+        if [[ "$network_interface" == default && \
+              -n "$active_network_interface" ]]; then
+            network_route_checks=$((network_route_checks + 1))
+            if ((network_route_checks >= 40)); then
+                network_route_checks=0
+                current_default_interface="$(default_network_interface)"
+                if [[ -n "$current_default_interface" && \
+                      "$current_default_interface" != \
+                      "$active_network_interface" ]]; then
+                    log "Default network interface changed from $active_network_interface to $current_default_interface; restarting UU on the preferred route."
+                    return 1
+                fi
+            fi
+        fi
+        if [[ "$follow_desktop_resolution" == on &&
+              "$desktop_relay" == vnc ]]; then
+            if ((resolution_grace_checks > 0)); then
+                resolution_grace_checks=$((resolution_grace_checks - 1))
+            else
+                resolution_checks=$((resolution_checks + 1))
+                if ((resolution_checks >= 20)); then
+                    resolution_checks=0
+                    current_desktop_resolution="$(desktop_geometry || true)"
+                    if [[ -z "$current_desktop_resolution" ||
+                          "$current_desktop_resolution" == "$resolution" ]]; then
+                        pending_resolution=""
+                        pending_resolution_checks=0
+                    elif [[ "$current_desktop_resolution" == \
+                            "$pending_resolution" ]]; then
+                        pending_resolution_checks=$((
+                            pending_resolution_checks + 1
+                        ))
+                    else
+                        pending_resolution="$current_desktop_resolution"
+                        pending_resolution_checks=1
+                    fi
+                    if ((pending_resolution_checks >= 3)); then
+                        if ! persist_relay_resolution \
+                            "$pending_resolution"; then
+                            log 'Could not persist the stable desktop resolution; retaining the current canvas.'
+                            pending_resolution=""
+                            pending_resolution_checks=0
+                        else
+                            log "Desktop resolution remained stable at $pending_resolution; restarting only the UU bridge to align its canvas."
+                            "${systemctl_user[@]}" --no-block restart \
+                                "$service_name" >/dev/null 2>&1 || return 1
+                            sleep 10
+                            return 1
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        if [[ "$desktop_monitor_watch" == true ]]; then
+            monitor_checks=$((monitor_checks + 1))
+            if ((monitor_checks >= 20)); then
+                monitor_checks=0
+                expected_monitor_mode="${monitor_fallback_value:-'mirror-primary'}"
+                current_monitor_mode="$(/usr/bin/env \
+                    DBUS_SESSION_BUS_ADDRESS="$desktop_bus" \
+                    /usr/bin/gsettings get org.gnome.desktop.remote-desktop.rdp \
+                    screen-share-mode 2>/dev/null || true)"
+                if [[ -n "$current_monitor_mode" &&
+                      "$current_monitor_mode" != "$expected_monitor_mode" ]]; then
+                    desktop_monitor_watch=false
+                    rm -f "$state_dir/monitor-fallback.mode"
+                    log 'GNOME screen sharing mode was changed externally; retaining the user-selected mode.'
+                fi
+                if [[ "$desktop_monitor_watch" == true &&
+                      "$current_monitor_mode" == "$expected_monitor_mode" ]]; then
+                    current_monitor_state="$(physical_monitor_state)"
+                else
+                    current_monitor_state=unknown
+                fi
+                if [[ ( -n "$monitor_fallback_original" &&
+                        "$current_monitor_state" == present ) ||
+                      ( -z "$monitor_fallback_original" &&
+                        "$current_monitor_state" == absent ) ]]; then
+                    monitor_transition_checks=$((monitor_transition_checks + 1))
+                else
+                    monitor_transition_checks=0
+                fi
+                if ((monitor_transition_checks >= 2)); then
+                    log "Physical monitor state is $current_monitor_state; requesting a planned bridge restart to switch the shared desktop."
+                    if "${systemctl_user[@]}" --no-block restart \
+                        "$service_name" >/dev/null 2>&1; then
+                        # Stay alive until systemd delivers TERM. Returning here
+                        # would report a planned transition as a child failure.
+                        while true; do sleep 1; done
+                    fi
+                    log 'Could not request the planned monitor transition; retaining the current relay.'
+                    monitor_transition_checks=0
+                fi
+            fi
+        fi
+        sleep 0.25
+    done
+}
+
+supervise_server "$server_pid" &
+server_supervisor_pid=$!
+
+log "UU Remote and the $desktop_relay desktop relay share DISPLAY=$DISPLAY; physical keyboard route=$active_keyboard_route; semantic phone text helper=$([[ -n "$x11_input_port" ]] && printf active || printf unavailable); one-way Mac clipboard=$([[ -n "$wine_clipboard_bridge_pid" ]] && printf active || printf unavailable)."
+
+set +e
+critical_pids=(
+    "$xvfb_pid"
+    "$openbox_pid"
+    "$winlogon_pid"
+    "$input_broker_pid"
+    "$server_supervisor_pid"
+)
+for optional_pid in \
+    "$manual_plane_pid" \
+    "$grd_pid" \
+    "$freerdp_pid" \
+    "$desktop_x11vnc_pid" \
+    "$vncviewer_pid" \
+    "$x11_input_pid" \
+    "$x11_clipboard_pid" \
+    "$wine_clipboard_bridge_pid" \
+    "$terminal_bridge_pid"; do
+    if [[ -n "$optional_pid" ]]; then
+        critical_pids+=("$optional_pid")
+    fi
+done
+exited_pid=""
+wait -n -p exited_pid "${critical_pids[@]}"
+child_status=$?
+set -e
+log "A bridge process exited (pid=${exited_pid:-unknown}, status=$child_status); systemd will restart the complete relay."
+exit 1

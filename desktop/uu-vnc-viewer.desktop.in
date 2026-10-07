@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TigerVNC 查看器
+Name[zh_CN]=TigerVNC 查看器
+Comment=Connect to a VNC server with readable local fonts
+Exec=/usr/bin/python3 "%HOME%/.local/libexec/uu-desktop-tool.py" viewer
+Icon=tigervnc
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=TigerVNC Viewer

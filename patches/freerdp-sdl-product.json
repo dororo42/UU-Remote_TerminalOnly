@@ -1,0 +1,78 @@
+{
+  "schema": 1,
+  "approval": "APPROVED_SOURCE_BUILD_CLOSURE",
+  "source_commit": "a8f1b46b0486b79e986d69530685af144268a9d0",
+  "source_lock_sha256": "cca85d70972508b0dfa1e437a542ed39b402a502bb31e333d9d7fd1a9eecd3d7",
+  "recipe_files": {
+    "bootstrap.sh": "e2af8b0a204aeba2cddacb0b8aa0869bde7c16b435b298c44bc74f0a850df26a",
+    "build-freerdp.sh": "23977cf37f4b5983f2b49838ce532569ed21ff5196467d4be252cd62736e219f",
+    "build-sdl.sh": "66b21a2c7666453a341b5ba94d517a981a42cf6f0659170fdcac6c9dfbd54bd8",
+    "check-lto.py": "9be2bb05bd2c5875df127345b8cbdccc10933edab7bfdb2fdfdd5bde1a854635",
+    "freerdp-sdl-owner-refresh.patch": "ec6f4c5c979a56bf50dad919b37002481e81805c63dfb5db406d3435ef6a6944",
+    "lto-cap.cmake": "6570fb24ff1f4979a26e8cc5975f6ea471e8115d3c1dfd153f617e21ce316bc8",
+    "mingw.ini": "afb8459779f240c3d6b88b8073a710c716cba1a60139bf4e5065b5163d1a3e9b",
+    "source-lock.json": "cca85d70972508b0dfa1e437a542ed39b402a502bb31e333d9d7fd1a9eecd3d7",
+    "strict-owner-unit.py": "d1948ba855d426fb9eb1657457255c3dc35936519f73e592175de242d6338dc0",
+    "toolchain.cmake": "58c3ae196f65334d89b8bdb1a7e0c31839b6c0d73272e4b68af0b413ae9759ea"
+  },
+  "files": {
+    "libcjson-1.dll": {
+      "sha256": "71a09f78d94ecee3f4002161e9b740ecf82c0c321501ce111bb8b5bc52f85a4e",
+      "size": 110707
+    },
+    "libcrypto-3-x64.dll": {
+      "sha256": "26c5c4804d14049dc50e7d1a7ba5fd479c1bcee3ae5c3942a7f069f5159a4745",
+      "size": 5501270
+    },
+    "libfreerdp-client3.dll": {
+      "sha256": "22092096d392034dc32d74888092dc7f83b2db4f62c7f7c0f19a1ea2c73f05f1",
+      "size": 1000818
+    },
+    "libfreerdp3.dll": {
+      "sha256": "8139fd05642be33add76aa6ca8fd2724e47d250c33779f760ba51684b7a263e8",
+      "size": 4740457
+    },
+    "libgcc_s_seh-1.dll": {
+      "sha256": "306983c483d96a6d08a2df044e360f0962e21dac021baf8311d3c0cb3b2c9def",
+      "size": 774200
+    },
+    "libssl-3-x64.dll": {
+      "sha256": "a3ddb63a654e05844cf59d463c9557eed7ae675d59fd2c47f3415f5e1fc067f5",
+      "size": 997269
+    },
+    "libstdc++-6.dll": {
+      "sha256": "dc04a17d6e9fe93bcb0639e93aca2811ad53c81c523e1909a2c24daf827fd2cd",
+      "size": 26347027
+    },
+    "liburiparser-1.dll": {
+      "sha256": "b760714d224f86fb3cb2c2d6229d0e631a2b5779d6533c920e189e356faad451",
+      "size": 188410
+    },
+    "libwinpr3.dll": {
+      "sha256": "b19d0455e2ce90da8af87a3793e250b110ae2a122eee1979feb82ed89760413f",
+      "size": 1813776
+    },
+    "libwinpthread-1.dll": {
+      "sha256": "db1a0fc43ab2f0f8d9c87712567f79601b5f868b9bed514d3335f9016de692ec",
+      "size": 349064
+    },
+    "ossl-modules/legacy.dll": {
+      "sha256": "c6b42a2754190aa9b79af323435aecb11c9ca5b9db27beabaebad238b1856a64",
+      "size": 141452
+    },
+    "sdl-freerdp.exe": {
+      "sha256": "490ddd7454ecc44b5d091b072cb825d8186353389733d466ef91b2ad585512c0",
+      "size": 10403387
+    },
+    "winpr-sspi-shim.dll": {
+      "sha256": "2cc51fe2d4f75aee365d2079fae823dd381d672c891cd59ebba00577da3548fb",
+      "size": 95644
+    }
+  },
+  "build_evidence": {
+    "kind": "verified_pinned_source_build",
+    "scope": "Runtime contents verified with the pinned source inputs and toolchain, including builds in distinct source and product directories.",
+    "path_independent_runtime_contents": true,
+    "runtime_checks": "Pinned runtime files and imports verified; detailed development records retained privately."
+  }
+}

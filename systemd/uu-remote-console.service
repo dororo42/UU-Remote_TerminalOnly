@@ -1,0 +1,21 @@
+[Unit]
+Description=Local noVNC console for UU Remote
+After=default.target uu-remote-bridge.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/uu-remote-bridge/environment
+ExecStart=%h/.local/bin/uu-remote-console serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+NoNewPrivileges=yes
+UMask=0077
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=default.target

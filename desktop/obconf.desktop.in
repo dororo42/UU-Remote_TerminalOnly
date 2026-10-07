@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Openbox Configuration Manager
+Name[zh_CN]=Openbox 配置管理器
+Comment=Configure Openbox with readable fonts and window sizing
+Exec=/usr/bin/python3 "%HOME%/.local/libexec/uu-desktop-tool.py" openbox
+Icon=obconf
+Terminal=false
+NoDisplay=true
+Hidden=true
+Categories=Settings;DesktopSettings;
+StartupNotify=true

@@ -1,0 +1,18 @@
+[Unit]
+Description=Restrict UU Remote's local RDP relay to loopback
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/sbin/iptables -C INPUT ! -i lo -p tcp --dport 3390 -j DROP 2>/dev/null || /usr/sbin/iptables -I INPUT ! -i lo -p tcp --dport 3390 -j DROP'
+ExecStart=/bin/sh -c '/usr/sbin/ip6tables -C INPUT ! -i lo -p tcp --dport 3390 -j DROP 2>/dev/null || /usr/sbin/ip6tables -I INPUT ! -i lo -p tcp --dport 3390 -j DROP'
+RemainAfterExit=yes
+# Optional system unit; install and enable it manually as root.
+# Stopping/disabling keeps the rules, including any identical pre-existing rule.
+# To remove them manually, first confirm that no other firewall owner needs them:
+# sudo iptables -D INPUT ! -i lo -p tcp --dport 3390 -j DROP
+# sudo ip6tables -D INPUT ! -i lo -p tcp --dport 3390 -j DROP
+
+[Install]
+WantedBy=multi-user.target

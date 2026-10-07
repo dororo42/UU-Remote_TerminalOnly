@@ -1,0 +1,17 @@
+[Unit]
+Description=UU Remote terminal-only canvas (Xvfb display :50, vnc relay target)
+# 用户级单元（安装到 bridge 用户的 ~/.config/systemd/user/）。
+# bridge 的 vnc relay 以 --desktop-target :50 连接本画布；同用户访问 unix socket 无需 xauth。
+# 上游 bridge 会自拉它自己的私有画布（UU 窗口渲染），本画布只作为 relay 的像素源。
+# 与 terminal-only/rollback-desktop.sh 配套；回退完整桌面版时 disable 并删除本文件。
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :50 -screen 0 1280x800x24 -nolisten tcp -noreset
+Restart=on-failure
+RestartSec=3
+# 无需 GUI 套件，Xvfb 常驻 ~40MB
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target

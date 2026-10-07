@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=UU Remote 画质与分辨率
+Name[en]=UU Remote Quality and Resolution
+GenericName=Remote Desktop Settings
+Comment=设置 UU 远程桌面分辨率和画质
+Comment[en]=Configure UU remote desktop resolution and quality
+Exec=@EXEC_QUALITY@
+Icon=024B_GameViewer.0
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true
+Keywords=UU;Remote;Quality;Resolution;画质;分辨率;远程;
