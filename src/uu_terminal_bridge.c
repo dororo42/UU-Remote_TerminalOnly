@@ -369,8 +369,17 @@ static int relay_client_frame(int client, int pty_master, int detach_on_eof)
         return 0;
     if (frame.type == UURB_TERMINAL_FRAME_DATA)
         return length > 0 && write_all_fd(pty_master, payload, length);
-    if (frame.type == UURB_TERMINAL_FRAME_RESIZE)
-        return length == 4 && apply_resize(pty_master, payload);
+    if (frame.type == UURB_TERMINAL_FRAME_RESIZE) {
+        /* Controllers can emit one out-of-range size transiently while the
+         * terminal window initializes (observed: 120x9001 right before the
+         * sane 120x30). Dropping the whole connection for it killed the PC
+         * terminal; ignore the frame and keep the previous size instead. */
+        if (length != 4 || !apply_resize(pty_master, payload)) {
+            fprintf(stderr, "terminal resize frame ignored\n");
+            return 1;
+        }
+        return 1;
+    }
     if (frame.type == UURB_TERMINAL_FRAME_EOF) {
         unsigned char end_of_input = 4;
 
