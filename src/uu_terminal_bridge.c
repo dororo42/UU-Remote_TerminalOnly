@@ -334,6 +334,85 @@ static int session_name_is_valid(const char *name, size_t length)
 static int active_sessions(void);
 static void send_busy_byte(int fd);
 
+/* Strip OSC 3008 "hierarchical context signalling" sequences (systemd 257+
+ * installs a profile hook on Ubuntu 26.04 that emits them around every
+ * command). UU's terminal renders them as literal text. The filter is
+ * stateful: sequences split across reads are handled. */
+static const char OSC3008_INTRO[] = "\x1b]3008;";
+
+static struct {
+    int in_sequence;        /* inside an OSC 3008 payload to strip */
+    size_t intro_matched;   /* prefix of OSC3008_INTRO matched so far */
+    int esc_seen;           /* inside the sequence: ESC of a possible ST */
+} osc3008_filter;
+
+static void osc3008_reset(void)
+{
+    osc3008_filter.in_sequence = 0;
+    osc3008_filter.intro_matched = 0;
+    osc3008_filter.esc_seen = 0;
+}
+
+/* Feed one chunk through the filter; returns the filtered length. */
+static size_t osc3008_filter_chunk(const unsigned char *in, size_t len,
+                                   unsigned char *out)
+{
+    size_t in_index = 0, out_index = 0;
+
+    while (in_index < len) {
+        unsigned char c = in[in_index++];
+        int emit = 1;
+
+        if (osc3008_filter.in_sequence) {
+            if (osc3008_filter.esc_seen) {
+                osc3008_reset();
+                if (c == 0x1b) {
+                    emit = 0;
+                    osc3008_filter.intro_matched = 1;   /* a new escape begins */
+                } else if (c == '\\') {
+                    emit = 0;                           /* ST completed, dropped */
+                } else {
+                    /* Spec-impossible: treat as resumed content. */
+                }
+            } else if (c == 0x07) {
+                osc3008_reset();                        /* BEL terminator */
+                emit = 0;
+            } else if (c == 0x1b) {
+                osc3008_filter.esc_seen = 1;
+                emit = 0;
+            } else {
+                emit = 0;                               /* stripped payload */
+            }
+            if (emit)
+                out[out_index++] = c;
+            continue;
+        }
+        if (osc3008_filter.intro_matched > 0 || c == 0x1b) {
+            if (c == (unsigned char)OSC3008_INTRO[osc3008_filter.intro_matched]) {
+                osc3008_filter.intro_matched++;
+                if (osc3008_filter.intro_matched == sizeof(OSC3008_INTRO) - 1) {
+                    osc3008_filter.in_sequence = 1;
+                    osc3008_filter.intro_matched = 0;
+                }
+                continue;
+            }
+            /* Mismatch: the held prefix is ordinary content — emit it, then
+             * reprocess this byte (it may itself start a new escape). */
+            for (size_t k = 0; k < osc3008_filter.intro_matched; k++)
+                out[out_index++] = (unsigned char)OSC3008_INTRO[k];
+            osc3008_filter.intro_matched = 0;
+            if (c == 0x1b) {
+                in_index--;                             /* reprocess as intro */
+                continue;
+            }
+            out[out_index++] = c;
+            continue;
+        }
+        out[out_index++] = c;
+    }
+    return out_index;
+}
+
 /* Authenticate a client without answering it; the caller accepts it only
  * once the connection has somewhere to go. */
 static int read_handshake(int client, const char *expected_token,
@@ -680,8 +759,15 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             if (received <= 0)
                 break;
             /* No viewer: output is dropped, as with dtach. */
-            if (attach >= 0 && !send_all_viewer(attach, payload, (size_t)received))
-                close_viewer(&attach);
+            if (attach >= 0) {
+                unsigned char filtered[sizeof(payload) + 16];
+                size_t filtered_len = osc3008_filter_chunk(
+                    payload, (size_t)received, filtered);
+
+                if (filtered_len > 0 &&
+                    !send_all_viewer(attach, filtered, filtered_len))
+                    close_viewer(&attach);
+            }
         }
         if (attach >= 0 && descriptors[2].fd == attach && descriptors[2].revents) {
             if (!(descriptors[2].revents & POLLIN) ||

@@ -295,6 +295,28 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         self.assertNotEqual(self.shell_pid(second), pid)
         second.close()
 
+    def test_osc3008_sequences_are_stripped(self):
+        # Ubuntu 26.04's systemd profile hook wraps every command in OSC 3008
+        # context signalling; UU's terminal renders it as literal text, so the
+        # broker strips it while passing everything else through.
+        port = self.start()
+        viewer = self.connect(port, self.ATTACH, "session1")
+        self.assertIsNotNone(viewer)
+        self.send_input(
+            viewer,
+            b"printf '\\033]3008;start=abc;type=shell;cwd=/home/doro\\033\\\\'"
+            b"MARK-KEPT'\\033]3008;end=abc\\033\\\\'; echo\n",
+        )
+        output = self.read_until(viewer, b"MARK-KEPT", 5)
+        self.assertIn(b"MARK-KEPT", output)
+        # The echoed command line itself contains the literal numbers; the
+        # assertion applies to what the shell actually emitted after it.
+        _echo, _, produced = output.partition(b"echo\r\n")
+        self.assertNotIn(b"3008", produced)
+        self.assertNotIn(b"type=shell", produced)
+        self.assertNotIn(b"machineid", produced)
+        viewer.close()
+
     def test_sessions_are_independent(self):
         port = self.start()
         first = self.connect(port, self.ATTACH, "session1")
