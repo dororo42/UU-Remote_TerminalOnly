@@ -419,7 +419,7 @@ static int read_handshake(int client, const char *expected_token,
                           struct handshake *result)
 {
     struct uurb_terminal_hello hello;
-    struct uurb_terminal_session session;
+    struct uurb_terminal_session session = {0, 0};
     char supplied_token[UURB_TERMINAL_TOKEN_LENGTH];
     const char *reject_reason = NULL;
     int64_t deadline = monotonic_milliseconds() + HANDSHAKE_TIMEOUT_MS;
@@ -440,26 +440,24 @@ static int read_handshake(int client, const char *expected_token,
     else if (!constant_time_equal(supplied_token, expected_token,
                                   sizeof(supplied_token)))
         reject_reason = "token_mismatch";
+    fprintf(stderr, "DBG hello(%zu) v=%u tl=%u\n", sizeof(hello),
+            ntohs(hello.version), ntohs(hello.token_length));
+    fprintf(stderr, "DBG token[0..3]: %02x %02x %02x %02x\n",
+            supplied_token[0], supplied_token[1], supplied_token[2],
+            supplied_token[3]);
     memset(supplied_token, 0, sizeof(supplied_token));
     if (reject_reason == NULL &&
         ntohs(hello.version) == UURB_TERMINAL_VERSION_SESSION) {
-        /* Validate the announced length before reading the name into the
-         * fixed stack buffer: name_length arrives from the wire (0-255) and
-         * result->name holds MAX_SESSION_NAME+1 bytes. */
+        /* Validate the announced length and role BEFORE reading the name
+         * into the fixed stack buffer: name_length arrives from the wire
+         * (0-255) and result->name holds MAX_SESSION_NAME+1 bytes. */
         if (read_exact_deadline(client, &session, sizeof(session), deadline) != 1)
             reject_reason = "session_read";
         else if ((session.role != UURB_TERMINAL_ROLE_ATTACH &&
                   session.role != UURB_TERMINAL_ROLE_ANCHOR) ||
                  session.name_length == 0 ||
-                 session.name_length > UURB_TERMINAL_MAX_SESSION_NAME) {
-            unsigned char discard_name[256];
+                 session.name_length > UURB_TERMINAL_MAX_SESSION_NAME)
             reject_reason = "session";
-            /* Drain the announced name so the close lands as a FIN, not an
-             * RST — clients treat a clean close as a rejection signal. */
-            if (session.name_length > 0)
-                read_exact_deadline(client, discard_name,
-                                    session.name_length, deadline);
-        }
         else if (read_exact_deadline(client, result->name, session.name_length,
                                      deadline) != 1)
             reject_reason = "session_read";
@@ -467,9 +465,16 @@ static int read_handshake(int client, const char *expected_token,
             reject_reason = "session";
         else
             result->role = session.role;
+        fprintf(stderr, "DBG v2: role=%u name_len=%u name=%.*s\n",
+                session.role, session.name_length,
+                (int)session.name_length, result->name);
     }
     if (reject_reason != NULL) {
-        fprintf(stderr, "rejected terminal bridge handshake reason=%s\n", reject_reason);
+        fprintf(stderr,
+                "DBG reject: rc=%s wire_role=%u wire_name_len=%u"
+                " version=%u\n",
+                reject_reason, session.role, session.name_length,
+                ntohs(hello.version));
         return 0;
     }
     result->version = ntohs(hello.version);
@@ -479,6 +484,10 @@ static int read_handshake(int client, const char *expected_token,
         result->size.ws_col = 80;
     if (result->size.ws_row == 0 || result->size.ws_row > 1000)
         result->size.ws_row = 24;
+    fprintf(stderr,
+            "DBG handshake: ok version=%u role=%u name=%s name_len=%u\n",
+            result->version, result->role, result->name,
+            (unsigned)strlen(result->name));
     return 1;
 }
 
