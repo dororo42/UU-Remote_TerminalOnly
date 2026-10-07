@@ -49,7 +49,7 @@ cd UU-Remote_TerminalOnly
 ./scripts/uu-remote status|logs|restart|stop
 ```
 
-**终端入口**：PC / 手机 UU 控制端 → 设备 → Terminal → PowerShell 入口（占位标签，实际为 Ubuntu 登录 shell）。另有官方端口映射 + SSH 路径（`docs/ssh-and-port-mapping.md`）与 `scripts/uu-ssh` 助手。
+**终端入口**：PC / 手机 UU 控制端 → 设备 → Terminal。shell 选择以面板实际显示为准（可能显示 cmd、PowerShell 或不显示标签）——无论哪个入口，打开的都是 **Ubuntu 登录 shell**（Windows 侧只是占位宿主）。另有官方端口映射 + SSH 路径（`docs/ssh-and-port-mapping.md`）与 `scripts/uu-ssh` 助手。
 
 ## 项目参考来源与谱系
 
