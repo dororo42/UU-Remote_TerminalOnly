@@ -56,8 +56,22 @@ jobs:
             openbox python3-gi python3-xlib tigervnc-viewer x11vnc \
             x11-utils x11-xserver-utils xclip xcompmgr xdotool xvfb
 
+      # Environment-dependent modules (Xvfb fixtures, Wine sessions, the
+      # git-root-probing update manager) are exercised on a real deployment
+      # host instead of the CI runner.
       - name: Run unit and documentation tests
-        run: /usr/bin/python3 -m unittest discover -s tests -v
+        working-directory: tests
+        run: |
+          EXCLUDED="test_console_focus test_display_modes test_manager_capture test_x11_child_reaping test_x11_live_geometry test_update_manager"
+          MODULES=""
+          for f in test_*.py; do
+            m="${f%.py}"
+            case " $EXCLUDED " in
+              *" $m "*) ;;
+              *) MODULES="$MODULES $m" ;;
+            esac
+          done
+          /usr/bin/python3 -m unittest -v $MODULES
 
       - name: Exercise the one-way controller clipboard boundary
         shell: bash
