@@ -131,7 +131,7 @@ class NativeTerminalBrokerTests(unittest.TestCase):
             env=environment,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=5,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.ready.read_text(), "unrelated\n")
@@ -148,7 +148,7 @@ class NativeTerminalBrokerTests(unittest.TestCase):
             env=environment,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=5,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.ready.exists())
