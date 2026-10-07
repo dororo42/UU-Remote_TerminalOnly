@@ -229,7 +229,12 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         self.send_input(second, b"stty size\n")
         self.assertIn(b"30 100", self.read_until(second, b"30 100"))
         anchor.close()
-        self.assertTrue(self.closed(second))
+        time.sleep(0.3)
+        # An anchor dropping must not end a session that still has a live
+        # viewer: controller-driven tree cleanup can kill the pane proxy
+        # while the terminal is in use. The session ends when its last
+        # participant (viewer or anchor) drops.
+        self.assertFalse(self.closed(second))
         second.close()
 
     def test_sessions_are_independent(self):
