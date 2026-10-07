@@ -1,6 +1,8 @@
-/* Grafted from GaryOAO/UUWay commit f192f65 (AGPL-3.0).
+/* Modified from GaryOAO/UUWay commit f192f65 (AGPL-3.0).
  * Source: https://github.com/GaryOAO/UUWay (see LICENSE.UUWay at repo root).
- * Unmodified except this notice. */
+ * Changes: hold the anchor for the conpty session lifetime after the launch
+ * script completes; verbatim chunked launch-script tracing; 24h ceiling on
+ * the session wait. Full history in this repository. */
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
@@ -46,7 +48,10 @@ static void trace_text(const char *event, const wchar_t *wide)
     size_t index = 0;
     int part = 0;
 
-    while (wide[index] != L'\0') {
+    /* The launch script carries no secrets (uuyc-mux/chcp commands only);
+     * eight chunks cover every script seen so far — anything longer is a
+     * signal to re-review what UU is asking this proxy to run. */
+    while (wide[index] != L'\0' && part < 8) {
         size_t used = 0;
         while (wide[index] != L'\0' && used + 1 < sizeof(narrow)) {
             narrow[used] = wide[index] <= L'~' ? (char)wide[index] : '?';
@@ -58,6 +63,8 @@ static void trace_text(const char *event, const wchar_t *wide)
         trace_event(line);
         part++;
     }
+    if (wide[index] != L'\0')
+        trace_event("mux_script_truncated");
 }
 static void trace_event(const char *event)
 {
@@ -814,7 +821,8 @@ static int wait_direct_session(HANDLE child)
     if (child != NULL)
         waits[count++] = child;
     trace_event("direct_session_wait");
-    signaled = WaitForMultipleObjects(count, waits, FALSE, INFINITE);
+    /* A 24h ceiling keeps a lost signal from wedging the anchor forever. */
+    signaled = WaitForMultipleObjects(count, waits, FALSE, 24LL * 60 * 60 * 1000);
     if (bridge != NULL)
         CloseHandle(bridge);
     CloseHandle(waits[0]);

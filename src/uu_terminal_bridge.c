@@ -1,6 +1,9 @@
-/* Grafted from GaryOAO/UUWay commit f192f65 (AGPL-3.0).
+/* Modified from GaryOAO/UUWay commit f192f65 (AGPL-3.0).
  * Source: https://github.com/GaryOAO/UUWay (see LICENSE.UUWay at repo root).
- * Unmodified except this notice. */
+ * Changes: out-of-range resize frames are ignored instead of dropping the
+ * viewer; a live viewer outlives a dropped anchor; viewer-send and idle
+ * timeouts are separate and tunable; anchor reads tolerate EAGAIN;
+ * session-limit rejections are logged. Full history in this repository. */
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
@@ -34,6 +37,8 @@
 #define HANDSHAKE_TIMEOUT_MS 5000
 #define FRAME_TIMEOUT_MS 5000
 #define IO_TIMEOUT_MS 5000
+#define VIEWER_SEND_TIMEOUT_MS 30000
+#define IDLE_GRACE_MS 60000
 #define POLL_SLICE_MS 100
 #define REDRAW_DELAY_MS 800
 
@@ -44,6 +49,11 @@ static pid_t broker_pid;
 static char ready_path[4096];
 static struct stat ready_identity;
 static int ready_identity_valid;
+/* Overridable through UURB_IO_TIMEOUT_MS / UURB_VIEWER_SEND_TIMEOUT_MS /
+ * UURB_IDLE_GRACE_MS for tests and deployments with unusual link budgets. */
+static int64_t io_timeout_ms = IO_TIMEOUT_MS;
+static int64_t viewer_send_timeout_ms = VIEWER_SEND_TIMEOUT_MS;
+static int64_t idle_grace_ms = IDLE_GRACE_MS;
 
 static void handle_signal(int signal_number)
 {
@@ -134,7 +144,7 @@ static int read_exact_deadline(int fd, void *buffer, size_t size, int64_t deadli
 static int write_all_fd(int fd, const void *buffer, size_t size)
 {
     const unsigned char *cursor = buffer;
-    const int64_t deadline = monotonic_milliseconds() + IO_TIMEOUT_MS;
+    const int64_t deadline = monotonic_milliseconds() + io_timeout_ms;
 
     while (size > 0) {
         ssize_t written;
@@ -157,7 +167,7 @@ static int write_all_fd(int fd, const void *buffer, size_t size)
 static int send_all(int fd, const void *buffer, size_t size)
 {
     const unsigned char *cursor = buffer;
-    const int64_t deadline = monotonic_milliseconds() + IO_TIMEOUT_MS;
+    const int64_t deadline = monotonic_milliseconds() + io_timeout_ms;
 
     while (size > 0) {
         ssize_t sent;
@@ -175,6 +185,41 @@ static int send_all(int fd, const void *buffer, size_t size)
         size -= (size_t)sent;
     }
     return 1;
+}
+
+/* Output toward a viewer: a stalled controller window must not cost the
+ * session — dropping the backlog is cheaper than dropping the shell. */
+static int send_all_viewer(int fd, const void *buffer, size_t size)
+{
+    const unsigned char *cursor = buffer;
+    const int64_t deadline = monotonic_milliseconds() + viewer_send_timeout_ms;
+
+    while (size > 0) {
+        ssize_t sent;
+
+        if (!wait_for_fd(fd, POLLOUT, deadline))
+            return 0;
+        sent = send(fd, cursor, size, MSG_NOSIGNAL | MSG_DONTWAIT);
+
+        if (sent <= 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            return 0;
+        }
+        cursor += sent;
+        size -= (size_t)sent;
+    }
+    return 1;
+}
+
+static void close_fd(int *fd);
+
+/* Half-close toward the viewer so a clean EOF reaches it before the RST. */
+static void close_viewer(int *fd)
+{
+    if (*fd >= 0)
+        shutdown(*fd, SHUT_WR);
+    close_fd(fd);
 }
 
 static void stop_shell(pid_t child)
@@ -240,8 +285,8 @@ static int apply_resize(int pty_master, const unsigned char *payload)
     memset(&size, 0, sizeof(size));
     size.ws_col = ntohs(columns_network);
     size.ws_row = ntohs(rows_network);
-    if (size.ws_col == 0 || size.ws_col > 1000 ||
-        size.ws_row == 0 || size.ws_row > 1000)
+    if (size.ws_col == 0 || size.ws_col > 4096 ||
+        size.ws_row == 0 || size.ws_row > 4096)
         return 0;
     {
         struct winsize current;
@@ -434,7 +479,7 @@ static int relay_transient(int client, struct winsize initial_size)
         if (descriptors[1].revents & POLLIN) {
             ssize_t size = read(pty_master, payload, sizeof(payload));
 
-            if (size <= 0 || !send_all(client, payload, (size_t)size))
+            if (size <= 0 || !send_all_viewer(client, payload, (size_t)size))
                 break;
         }
         if ((descriptors[0].revents & POLLIN) &&
@@ -533,7 +578,7 @@ static void request_redraw(int pty_master, unsigned int columns, unsigned int ro
     struct winsize size;
 
     memset(&size, 0, sizeof(size));
-    if (columns == 0 || columns > 1000 || rows == 0 || rows > 1000)
+    if (columns == 0 || columns > 4096 || rows == 0 || rows > 4096)
         return;
     size.ws_col = (unsigned short)columns;
     size.ws_row = (unsigned short)(rows > 1 ? rows - 1 : rows + 1);
@@ -557,7 +602,9 @@ static int hold_session(int listener, int client, const struct handshake *handsh
     int anchors[MAX_ANCHORS];
     int anchor_count = 0;
     int anchored = 0;
+    int ever_anchored = 0;
     int attach = client;
+    int64_t idle_deadline = 0;
     int64_t redraw_at = monotonic_milliseconds() + REDRAW_DELAY_MS;
     int pty_master = -1;
     int status;
@@ -613,13 +660,13 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             if (received <= 0)
                 break;
             /* No viewer: output is dropped, as with dtach. */
-            if (attach >= 0 && !send_all(attach, payload, (size_t)received))
-                close_fd(&attach);
+            if (attach >= 0 && !send_all_viewer(attach, payload, (size_t)received))
+                close_viewer(&attach);
         }
         if (attach >= 0 && descriptors[2].fd == attach && descriptors[2].revents) {
             if (!(descriptors[2].revents & POLLIN) ||
                 !relay_client_frame(attach, pty_master, 1))
-                close_fd(&attach);
+                close_viewer(&attach);
         }
         for (index = anchor_count - 1, first_anchor = count - anchor_count;
              index >= 0; index--) {
@@ -628,7 +675,12 @@ static int hold_session(int listener, int client, const struct handshake *handsh
 
             if (!entry->revents)
                 continue;
-            if (recv(anchors[index], discard, sizeof(discard), MSG_DONTWAIT) > 0)
+            ssize_t seen = recv(anchors[index], discard, sizeof(discard),
+                                MSG_DONTWAIT);
+            if (seen > 0)
+                continue;
+            if (seen < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                             errno == EINTR))
                 continue;
             close(anchors[index]);
             anchors[index] = anchors[--anchor_count];
@@ -642,8 +694,21 @@ static int hold_session(int listener, int client, const struct handshake *handsh
                 break;
             anchored = 0;
         }
-        if (!anchored && attach < 0)
-            break;
+        if (!anchored && attach < 0) {
+            /* Grace window for sessions that were anchored before: the PC
+             * controller's tree cleanup kills the pane proxy mid-session,
+             * and a stalled viewer gets kicked — give the client time to
+             * reconnect. Sessions never anchored end with their viewer, as
+             * before. */
+            if (!ever_anchored)
+                break;
+            if (idle_deadline == 0)
+                idle_deadline = monotonic_milliseconds() + idle_grace_ms;
+            if (monotonic_milliseconds() >= idle_deadline)
+                break;
+        } else {
+            idle_deadline = 0;
+        }
 
         if (descriptors[0].revents & POLLIN) {
             struct handoff message;
@@ -671,6 +736,7 @@ static int hold_session(int listener, int client, const struct handshake *handsh
             } else if (anchor_count < MAX_ANCHORS) {
                 anchors[anchor_count++] = received;
                 anchored = 1;
+                ever_anchored = 1;
             } else {
                 close(received);
             }
@@ -981,6 +1047,18 @@ int main(int argc, char **argv)
     sigaction(SIGCHLD, &action, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    {
+        const char *override = getenv("UURB_IO_TIMEOUT_MS");
+
+        if (override != NULL && strtoul(override, NULL, 10) > 0)
+            io_timeout_ms = (int64_t)strtoul(override, NULL, 10);
+        override = getenv("UURB_VIEWER_SEND_TIMEOUT_MS");
+        if (override != NULL && strtoul(override, NULL, 10) > 0)
+            viewer_send_timeout_ms = (int64_t)strtoul(override, NULL, 10);
+        override = getenv("UURB_IDLE_GRACE_MS");
+        if (override != NULL && strtoul(override, NULL, 10) > 0)
+            idle_grace_ms = (int64_t)strtoul(override, NULL, 10);
+    }
     listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener < 0)
         goto done;
@@ -1026,6 +1104,7 @@ int main(int argc, char **argv)
         }
         slot = available_slot();
         if (slot < 0) {
+            fprintf(stderr, "terminal session rejected: session limit reached\n");
             close(client);
             continue;
         }

@@ -53,20 +53,23 @@ class NativeTerminalBrokerTests(unittest.TestCase):
             path.unlink()
         self.directory.rmdir()
 
-    def start(self, token_file=True, environment_token=None):
-        environment = os.environ.copy()
-        environment.pop("UURB_TERMINAL_BRIDGE_TOKEN", None)
+    def start(self, token_file=True, environment_token=None, environment=None):
+        env = os.environ.copy()
+        env.pop("UURB_TERMINAL_BRIDGE_TOKEN", None)
+        if environment:
+            env.update(environment)
         arguments = [str(self.executable), "--ready-file", str(self.ready)]
         if token_file:
             arguments.extend(("--token-file", str(self.token_file)))
         if environment_token is not None:
-            environment["UURB_TERMINAL_BRIDGE_TOKEN"] = environment_token
+            env["UURB_TERMINAL_BRIDGE_TOKEN"] = environment_token
+        self.broker_log = self.directory / "broker-stderr.log"
         self.process = subprocess.Popen(
             arguments,
             cwd=ROOT,
-            env=environment,
+            env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=self.broker_log.open("ab"),
         )
         deadline = time.monotonic() + 2
         while not self.ready.exists() and self.process.poll() is None and time.monotonic() < deadline:
@@ -235,6 +238,45 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         # while the terminal is in use. The session ends when its last
         # participant (viewer or anchor) drops.
         self.assertFalse(self.closed(second))
+        second.close()
+
+    def test_output_stall_kicks_viewer_and_grace_keeps_shell(self):
+        # A stalled controller window (viewer send timeout) kicks the viewer;
+        # the unanchored grace window then keeps the shell alive for the
+        # reconnect. Without these, one stalled send on an anchorless
+        # (PC-shaped) session tore the session down.
+        port = self.start(environment={
+            "UURB_VIEWER_SEND_TIMEOUT_MS": "200",
+            "UURB_IDLE_GRACE_MS": "8000",
+        })
+        first = self.connect(port, self.ATTACH, "session1")
+        self.assertIsNotNone(first)
+        pid = self.shell_pid(first)
+        anchor = self.connect(port, self.ANCHOR, "session1")
+        self.assertIsNotNone(anchor)
+        anchor.close()
+        time.sleep(0.3)
+        # The pane anchor is gone (controller tree cleanup); flood the shell
+        # output without reading so the viewer send stalls and gets kicked.
+        self.send_input(first, b"head -c 10000000 /dev/zero | tr '\\0' 'x'\n")
+        time.sleep(0.8)
+        self.assertTrue(self.closed(first, timeout=5))
+        second = self.connect(port, self.ATTACH, "session1", 100, 30)
+        self.assertIsNotNone(second)
+        self.assertEqual(self.shell_pid(second), pid)
+        second.close()
+
+    def test_unanchored_grace_expiry_ends_session(self):
+        port = self.start(environment={"UURB_IDLE_GRACE_MS": "1500"})
+        first = self.connect(port, self.ATTACH, "session1")
+        self.assertIsNotNone(first)
+        pid = self.shell_pid(first)
+        first.close()
+        time.sleep(2.5)
+        second = self.connect(port, self.ATTACH, "session1", 100, 30)
+        self.assertIsNotNone(second)
+        # The grace expired: the old session ended and a fresh shell started.
+        self.assertNotEqual(self.shell_pid(second), pid)
         second.close()
 
     def test_sessions_are_independent(self):
