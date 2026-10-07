@@ -25,6 +25,10 @@ enum uurb_terminal_frame_type {
  * and return; the session's shell ends when its last anchor disconnects.
  * Without an anchor the session ends with its attach connection. */
 #define UURB_TERMINAL_VERSION_SESSION 2U
+/* One-byte pre-handshake response used before the hello is parsed:
+ * ACCEPTED (0x06) continues the handshake; BUSY (0x07) means the broker is
+ * at its session/anchor limit and the client should fall back or retry. */
+#define UURB_TERMINAL_BUSY 0x07
 #define UURB_TERMINAL_MAX_SESSION_NAME 64U
 
 enum uurb_terminal_role {
@@ -41,6 +45,11 @@ struct uurb_terminal_hello {
     uint16_t rows;
 };
 
+/* role/name_length validity (enforced by read_handshake):
+ *   role      ∈ {ATTACH=1, ANCHOR=2}; any other value rejects.
+ *   name_len  ∈ [1, UURB_TERMINAL_MAX_SESSION_NAME]; 0 and >64 reject.
+ *   name      must match [A-Za-z0-9_.-]+ and must not start with '.' or '-'.
+ * The name is read only after the length check (P0-4). */
 struct uurb_terminal_session {
     uint8_t role;
     uint8_t name_length;

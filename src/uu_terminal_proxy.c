@@ -382,7 +382,7 @@ static DWORD WINAPI control_worker(LPVOID unused)
         if (type == 2) {
             trace_event("control_exit");
             SetEvent(stop_event);
-            shutdown(terminal_socket, SD_BOTH);
+            shutdown(terminal_socket, SD_SEND);
             break;
         }
         if (type != 1) {
@@ -1043,11 +1043,21 @@ static int anchor_session(const char *token, uint16_t port, const char *name)
         return 0;
     }
     trace_event("anchor_held");
+    /* Bound the hold: if the broker wedges without closing the anchor, the
+     * pane proxy must not leak forever. */
+    {
+        DWORD rcv_timeout_ms = 5000;
+
+        setsockopt(anchor, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&rcv_timeout_ms, sizeof(rcv_timeout_ms));
+    }
     while (recv(anchor, discard, sizeof(discard), 0) > 0)
         ;
-    trace_error("anchor_recv_ended", WSAGetLastError());
+    if (WSAGetLastError() == WSAETIMEDOUT)
+        trace_event("anchor_hold_timeout");
+    else
+        trace_event("anchor_released");
     closesocket(anchor);
-    trace_event("anchor_released");
     return 1;
 }
 
@@ -1062,7 +1072,7 @@ int main(int argc, char **argv)
     HANDLE resize_thread = NULL;
     HANDLE control_thread = NULL;
     HANDLE output;
-    unsigned char buffer[16384];
+    unsigned char buffer[65536];
     uint16_t columns;
     uint16_t rows;
     uint16_t port;
@@ -1204,13 +1214,13 @@ int main(int argc, char **argv)
         DeleteCriticalSection(&send_lock);
         goto done;
     }
-    input_thread = CreateThread(NULL, 0, input_worker, NULL, 0, NULL);
+    input_thread = CreateThread(NULL, 256 * 1024, input_worker, NULL, 0, NULL);
     /* A passed control pipe is the authoritative resize source. Polling
      * pipe-backed stdout would otherwise keep resetting it to initial args. */
     if (proxy_control == NULL)
-        resize_thread = CreateThread(NULL, 0, resize_worker, NULL, 0, NULL);
+        resize_thread = CreateThread(NULL, 256 * 1024, resize_worker, NULL, 0, NULL);
     if (proxy_control != NULL)
-        control_thread = CreateThread(NULL, 0, control_worker, NULL, 0, NULL);
+        control_thread = CreateThread(NULL, 256 * 1024, control_worker, NULL, 0, NULL);
     if (input_thread == NULL ||
         (proxy_control == NULL && resize_thread == NULL) ||
         (proxy_control != NULL && control_thread == NULL)) {
@@ -1251,7 +1261,7 @@ int main(int argc, char **argv)
 
 workers_done:
     SetEvent(stop_event);
-    shutdown(terminal_socket, SD_BOTH);
+    shutdown(terminal_socket, SD_SEND);
     if (input_thread != NULL) {
         CancelSynchronousIo(input_thread);
         WaitForSingleObject(input_thread, 1000);

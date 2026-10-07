@@ -39,7 +39,7 @@ log "bridge 用户 = $bridge_user（上游约定：谁安装谁运行）"
 
 free_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
 (( free_mb >= 1800 )) || die "可用内存 ${free_mb}MB < 1800MB，至少需要 2GB 空闲"
-disk_gb=$(df --output=avail -BG "$repo_dir" | tail -1 | tr -dc '0-9')
+disk_gb=$(df -P "$repo_dir" | tail -1 | awk '{print int($4/1024)}')
 (( disk_gb >= 5 )) || die "磁盘可用 ${disk_gb}GB < 5GB"
 
 curl -sfI --max-time 8 "https://api.nrd.nie.163.com/api/v1/release/dl/1?channel=gwqd" -o /dev/null \
@@ -52,6 +52,16 @@ log "安装 Xvfb（画布依赖）"
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends xvfb x11-utils
 
+case "$CANVAS_DISPLAY" in
+    :[0-9]) ;;
+    :[1-9][0-9]) ;;
+    :[1-9][0-9][0-9]) ;;
+    *) die "CANVAS_DISPLAY 必须形如 :N（例如 :50），当前为 $CANVAS_DISPLAY" ;;
+esac
+case "$CANVAS_RESOLUTION" in
+    [1-9][0-9]*x[1-9][0-9]*) ;;
+    *) die "CANVAS_RESOLUTION 必须形如 宽x高（例如 1280x800），当前为 $CANVAS_RESOLUTION" ;;
+esac
 log "部署画布用户单元（Xvfb $CANVAS_DISPLAY，$CANVAS_RESOLUTION）"
 install -d -m 0755 "$HOME/.config/systemd/user"
 sed -e "s/:50/$CANVAS_DISPLAY/g" -e "s/1280x800/$CANVAS_RESOLUTION/g" \
@@ -97,18 +107,22 @@ wine_prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu
 # ── 4. 部署后自检 ───────────────────────────────────────────
 log "启动桥并自检"
 systemctl --user restart uu-remote-bridge.service
-sleep 20
-systemctl --user is-active --quiet uu-remote-bridge.service \
-    && log "✓ uu-remote-bridge active" \
-    || warn "✗ uu-remote-bridge 未运行：journalctl --user -u uu-remote-bridge -n 50"
-systemctl --user is-active --quiet uu-canvas-session.service \
-    && log "✓ uu-canvas-session active" \
-    || warn "✗ uu-canvas-session 未激活"
+runtime_file="/run/user/$(id -u)/uu-remote-bridge/terminal.port"
+ready=false
+for _ in {1..60}; do
+    systemctl --user is-active --quiet uu-remote-bridge.service || break
+    [[ -s "$runtime_file" ]] && ready=true && break
+    sleep 0.5
+done
 if systemctl --user is-active --quiet uu-remote-bridge.service; then
     log "✓ uu-remote-bridge active"
 else
     warn "✗ uu-remote-bridge 未运行：journalctl --user -u uu-remote-bridge -n 50"
+    journalctl --user -u uu-remote-bridge -n 20 --no-pager | tail -10
 fi
+systemctl --user is-active --quiet uu-canvas-session.service \
+    && log "✓ uu-canvas-session active" \
+    || warn "✗ uu-canvas-session 未激活"
 # 登录通道：noVNC console 直接看 UU 私有画布（上游仅在部分路径启用它）
 systemctl --user enable --now uu-remote-console.service \
     && log "✓ noVNC console 已启用（http://127.0.0.1:6080）" \

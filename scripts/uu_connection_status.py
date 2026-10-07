@@ -76,7 +76,8 @@ def format_number(value: object) -> str:
 def summarize(log_dir: Path) -> tuple[list[str], int]:
     reports = load_reports(log_dir)
     if not reports:
-        return (["No completed UU stream report was found."], 1)
+        return (["No completed UU stream report was found.",
+                 "status=offline"], 1)
 
     stream_log, report, completed_at = reports[-1]
     matching_server_log = stream_log.with_name(
@@ -167,6 +168,9 @@ def summarize(log_dir: Path) -> tuple[list[str], int]:
             "Note: this completed session is stale and does not describe a "
             "newly started or currently idle bridge."
         )
+    lines.append(
+        f"status={'recent' if age_seconds < 300 else 'stale'}"
+    )
     return lines, 0
 
 
@@ -186,6 +190,8 @@ def main() -> int:
         print(f"UU log directory is unavailable: {log_dir}", file=sys.stderr)
         return 1
     lines, status = summarize(log_dir)
+    # Machine-readable trailer for scripts (verify-terminal-only): a report
+    # younger than five minutes means a controlled session is current.
     print("\n".join(lines))
     return status
 

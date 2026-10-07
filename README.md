@@ -63,6 +63,19 @@ cd UU-Remote_TerminalOnly
 
 也感谢官方 Mac 被控端"tmux 会话复用器"设计（[AlliotTech/uu-tmux](https://github.com/AlliotTech/uu-tmux) 逆向揭示）对本项目终端架构的启发。
 
+## 运行时调参
+
+桥进程支持环境变量(经 `~/.config/uu-remote-bridge/environment` 或 systemd 单元注入):
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `UURB_IO_TIMEOUT_MS` | 5000 | PTY 输入方向写超时(粘贴大文本路径) |
+| `UURB_VIEWER_SEND_TIMEOUT_MS` | 30000 | 输出方向发往控制端窗口的超时(停顿只丢积压,不丢会话) |
+| `UURB_IDLE_GRACE_MS` | 60000 | 曾锚定的会话在 viewer 掉线后的存活宽限(重连窗口) |
+| `UURB_WINEPREFIX` / `WINEPREFIX` | 默认 prefix | 自定义 wineprefix 时 shim 自动跟随 |
+
+越界值(>24h 或 <100ms)会被忽略并记日志,回落默认。终端诊断 trace 的事件字典见 [docs/trace-events.md](docs/trace-events.md)。
+
 ## 文档
 
 `docs/` 保留终端运营核心子集：[原生终端链路](docs/native-ubuntu-terminal.md) · [SSH 与端口映射](docs/ssh-and-port-mapping.md) · [故障排查](docs/troubleshooting.md) · [安全模型](docs/security.md) · [架构](docs/architecture.md) · [无启动部署](docs/unattended-startup.md) · [源码构建](docs/source-build.md) · [Ubuntu 26.04 移植](docs/ubuntu-26.04-port.md)。完整上游文档见上游仓库。

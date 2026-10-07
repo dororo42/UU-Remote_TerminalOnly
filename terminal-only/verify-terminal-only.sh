@@ -38,23 +38,27 @@ else
 fi
 
 echo "── 3. UU 进程与在线态 ──"
-if pgrep -f -i "GameViewerServer|gameviewer" >/dev/null 2>&1; then
+if pgrep -f 'C:.*GameViewerServer\.exe' >/dev/null 2>&1; then
     ok "UU GameViewerServer 进程存在（Wine 内）"
 else
     bad "未发现 UU 进程（Wine prefix 未启动或安装未完成）"
 fi
-if "$repo_dir/scripts/uu_connection_status.py" 2>/dev/null | grep -qiE "online|connected|在线|true"; then
-    ok "UU 账号在线"
+connection_status="$("$repo_dir/scripts/uu_connection_status.py" 2>/dev/null |
+    sed -n 's/^status=//p')"
+if [[ "$connection_status" == "recent" ]]; then
+    ok "UU 有近期的控制会话"
+elif [[ "$connection_status" == "stale" ]]; then
+    warn "UU 会话记录已过期（超过 5 分钟未连接）"
 else
     warn "UU 在线态未确认——未登录？浏览器走 noVNC 扫码：ssh -L 6080:127.0.0.1:6080 后开 http://127.0.0.1:6080"
 fi
 
 echo "── 4. 终端桥组件 ──"
 wine_prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu-remote}}"
-if [[ -f "$repo_dir/bin/uu-terminal-proxy.exe" || -n "$(find "$repo_dir" "$wine_prefix" -maxdepth 4 -name 'uu-terminal-proxy.exe' 2>/dev/null | head -1)" ]]; then
+if [[ -f "$wine_prefix/compat/uu-terminal-proxy.exe" ]]; then
     ok "uu-terminal-proxy.exe 已安装"
 else
-    warn "未定位到 uu-terminal-proxy.exe（路径可能不同，test-terminal-bridge.sh 会给出权威结论）"
+    warn "未定位到 uu-terminal-proxy.exe（应在 $wine_prefix/compat/）"
 fi
 shim_dll="$wine_prefix/compat/uu-conpty.dll"
 conpty_dll="$wine_prefix/drive_c/Program Files/Netease/GameViewer/bin/conpty.dll"

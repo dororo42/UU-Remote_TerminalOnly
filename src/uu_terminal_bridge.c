@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <poll.h>
 #include <pty.h>
 #include <pwd.h>
@@ -317,7 +318,8 @@ static int session_name_is_valid(const char *name, size_t length)
 {
     size_t index;
 
-    if (length == 0 || length > UURB_TERMINAL_MAX_SESSION_NAME || name[0] == '.')
+    if (length == 0 || length > UURB_TERMINAL_MAX_SESSION_NAME ||
+        name[0] == '.' || name[0] == '-')
         return 0;
     for (index = 0; index < length; index++) {
         char c = name[index];
@@ -328,6 +330,9 @@ static int session_name_is_valid(const char *name, size_t length)
     }
     return 1;
 }
+
+static int active_sessions(void);
+static void send_busy_byte(int fd);
 
 /* Authenticate a client without answering it; the caller accepts it only
  * once the connection has somewhere to go. */
@@ -753,12 +758,17 @@ static int hold_session(int listener, int client, const struct handshake *handsh
                 anchored = 1;
                 ever_anchored = 1;
             } else {
+                fprintf(stderr, "terminal anchor rejected: anchors=%d limit=%d\n",
+                        anchor_count, MAX_ANCHORS);
+                send_busy_byte(received);
                 close(received);
             }
         }
     }
 
     close(listener);
+    /* Half-close so the viewer's final screen bytes drain before the RST. */
+    shutdown(attach, SHUT_WR);
     close_fd(&attach);
     for (index = 0; index < anchor_count; index++)
         close(anchors[index]);
@@ -802,9 +812,11 @@ static int route_session(int client, const struct handshake *handshake)
             return 1;
         if (bind(listener, (struct sockaddr *)&address, address_size) != 0 ||
             listen(listener, MAX_ANCHORS) != 0) {
-            /* Another handler created the session first; join it. */
+            /* Another handler created the session first; join it after a
+             * short backoff (50/100/200 ms). */
+            fprintf(stderr, "terminal join_after_race attempt=%d\n", attempt);
             close(listener);
-            usleep(50000);
+            usleep(50000 << attempt);
             continue;
         }
         if (!send_accepted(client)) {
@@ -813,6 +825,8 @@ static int route_session(int client, const struct handshake *handshake)
         }
         return hold_session(listener, client, handshake);
     }
+    fprintf(stderr, "terminal join raced three times; refusing with BUSY\n");
+    send_busy_byte(client);
     return 1;
 }
 
@@ -853,6 +867,25 @@ static int available_slot(void)
             return (int)index;
     }
     return -1;
+}
+
+static int active_sessions(void)
+{
+    int count = 0;
+
+    for (size_t index = 0; index < MAX_SESSIONS; index++) {
+        if (handlers[index] != 0)
+            count++;
+    }
+    return count;
+}
+
+static void send_busy_byte(int fd)
+{
+    unsigned char busy = UURB_TERMINAL_BUSY;
+
+    if (fd >= 0)
+        send(fd, &busy, sizeof(busy), MSG_NOSIGNAL);
 }
 
 static int private_parent_directory(const char *path)
@@ -964,10 +997,80 @@ static int write_ready_file(const char *path, uint16_t port)
         unlink(temporary);
         return 0;
     }
-    /* link()+unlink() publishes without replacing an existing or symlink path. */
+    /* link()+unlink() publishes without replacing an existing or symlink
+     * path. A previous crash can leave a stale ready file behind: take it
+     * over only when it is our own regular file whose recorded port is no
+     * longer served; anything else stays fail-closed. */
     if (link(temporary, path) != 0) {
-        unlink(temporary);
-        return 0;
+        struct stat existing;
+        char buffer[32] = {0};
+        unsigned long stale_port = 0;
+        int served = 0;
+        int probe_fd;
+
+        if (lstat(path, &existing) != 0 || !S_ISREG(existing.st_mode) ||
+            existing.st_uid != geteuid()) {
+            fprintf(stderr, "ready file exists and is not a stale own file\n");
+            unlink(temporary);
+            return 0;
+        }
+        probe_fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (probe_fd >= 0) {
+            ssize_t received = read(probe_fd, buffer, sizeof(buffer) - 1);
+
+            close(probe_fd);
+            if (received > 0) {
+                buffer[received] = '\0';
+                stale_port = strtoul(buffer, NULL, 10);
+            }
+        }
+        if (stale_port == 0 || stale_port > 65535) {
+            /* Not a broker ready file (no parseable port): foreign file,
+             * fail closed exactly like link-publish would. */
+            fprintf(stderr, "ready file exists and is not a stale own file\n");
+            unlink(temporary);
+            return 0;
+        }
+        if (stale_port <= 65535) {
+            struct sockaddr_in probe;
+            struct timeval timeout = {1, 0};
+            fd_set writable;
+            int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+
+            memset(&probe, 0, sizeof(probe));
+            probe.sin_family = AF_INET;
+            probe.sin_port = htons((uint16_t)stale_port);
+            probe.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (sock >= 0) {
+                if (connect(sock, (struct sockaddr *)&probe, sizeof(probe)) == 0) {
+                    served = 1;
+                } else if (errno == EINPROGRESS) {
+                    FD_ZERO(&writable);
+                    FD_SET(sock, &writable);
+                    if (select(sock + 1, NULL, &writable, NULL, &timeout) > 0) {
+                        int so_error = 0;
+                        socklen_t length = sizeof(so_error);
+
+                        getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &length);
+                        served = so_error == 0;
+                    }
+                }
+                close(sock);
+            }
+        }
+        if (served) {
+            fprintf(stderr, "ready file port %lu is served by a live broker\n",
+                    stale_port);
+            unlink(temporary);
+            return 0;
+        }
+        fprintf(stderr, "taking over a stale ready file (port %lu is dead)\n",
+                stale_port);
+        unlink(path);
+        if (link(temporary, path) != 0) {
+            unlink(temporary);
+            return 0;
+        }
     }
     if (unlink(temporary) != 0) {
         remove_matching_file(path, &identity);
@@ -1063,17 +1166,32 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     {
-        const char *override = getenv("UURB_IO_TIMEOUT_MS");
+        const char *names[] = {"UURB_IO_TIMEOUT_MS",
+                               "UURB_VIEWER_SEND_TIMEOUT_MS",
+                               "UURB_IDLE_GRACE_MS"};
+        int64_t *targets[] = {&io_timeout_ms, &viewer_send_timeout_ms,
+                              &idle_grace_ms};
+        for (size_t index = 0; index < 3; index++) {
+            const char *override = getenv(names[index]);
+            unsigned long long value;
 
-        if (override != NULL && strtoul(override, NULL, 10) > 0)
-            io_timeout_ms = (int64_t)strtoul(override, NULL, 10);
-        override = getenv("UURB_VIEWER_SEND_TIMEOUT_MS");
-        if (override != NULL && strtoul(override, NULL, 10) > 0)
-            viewer_send_timeout_ms = (int64_t)strtoul(override, NULL, 10);
-        override = getenv("UURB_IDLE_GRACE_MS");
-        if (override != NULL && strtoul(override, NULL, 10) > 0)
-            idle_grace_ms = (int64_t)strtoul(override, NULL, 10);
+            if (override == NULL)
+                continue;
+            value = strtoul(override, NULL, 10);
+            if (value < 100 || value > 86400000) {
+                fprintf(stderr,
+                        "terminal bridge ignores %s=%s (out of range)\n",
+                        names[index], override);
+                continue;
+            }
+            *targets[index] = (int64_t)value;
+        }
     }
+    /* NOTE: deliberately NOT calling prctl(PR_SET_DUMPABLE, 0) here — with
+     * dumpable cleared, /proc/<pid>/fd ownership flips to root and `ss -p`
+     * can no longer attribute the listening socket, which breaks the
+     * verify.sh terminal checks. Core dumps are restricted system-wide via
+     * core_pattern/apport instead. */
     listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (listener < 0)
         goto done;
@@ -1119,7 +1237,10 @@ int main(int argc, char **argv)
         }
         slot = available_slot();
         if (slot < 0) {
-            fprintf(stderr, "terminal session rejected: session limit reached\n");
+            fprintf(stderr, "terminal session rejected: session limit reached"
+                            " (active=%d limit=%d)\n",
+                    active_sessions(), MAX_SESSIONS);
+            send_busy_byte(client);
             close(client);
             continue;
         }
@@ -1148,6 +1269,10 @@ done:
     }
     for (index = 0; index < MAX_SESSIONS; index++) {
         if (handlers[index] > 0) {
+            struct timespec grace = {2, 0};
+
+            nanosleep(&grace, NULL);
+            kill(handlers[index], SIGKILL);
             while (waitpid(handlers[index], NULL, 0) < 0 && errno == EINTR)
                 ;
         }

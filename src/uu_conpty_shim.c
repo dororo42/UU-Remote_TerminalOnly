@@ -241,6 +241,39 @@ static int send_all_socket(SOCKET socket, const void *data, int length)
     return 1;
 }
 
+/* Loopback connects instantly; bound it anyway so a wedged WSA stack
+ * degrades to the Wine fallback instead of hanging the terminal open. */
+static int connect_with_deadline(SOCKET connection,
+                                 const struct sockaddr *address,
+                                 int length)
+{
+    u_long nonblocking = 1;
+    int result;
+
+    ioctlsocket(connection, FIONBIO, &nonblocking);
+    result = connect(connection, address, length);
+    if (result == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable;
+        struct timeval timeout = {2, 0};
+
+        FD_ZERO(&writable);
+        FD_SET(connection, &writable);
+        if (select(0, NULL, &writable, NULL, &timeout) <= 0) {
+            result = SOCKET_ERROR;
+        } else {
+            int so_error = 0;
+            int size = (int)sizeof(so_error);
+
+            getsockopt(connection, SOL_SOCKET, SO_ERROR, (char *)&so_error,
+                       &size);
+            result = so_error != 0 ? SOCKET_ERROR : 0;
+        }
+    }
+    nonblocking = 0;
+    ioctlsocket(connection, FIONBIO, &nonblocking);
+    return result;
+}
+
 static SOCKET connect_broker(COORD size)
 {
     struct sockaddr_in address;
@@ -272,7 +305,8 @@ static SOCKET connect_broker(COORD size)
     hello.columns = htons((uint16_t)(size.X > 0 ? size.X : 80));
     hello.rows = htons((uint16_t)(size.Y > 0 ? size.Y : 24));
     if (connection == INVALID_SOCKET ||
-        connect(connection, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        !connect_with_deadline(connection, (struct sockaddr *)&address,
+                               sizeof(address)) ||
         !send_all_socket(connection, &hello, sizeof(hello)) ||
         !send_all_socket(connection, token, UURB_TERMINAL_TOKEN_LENGTH) ||
         (name_length > 0 &&
@@ -378,9 +412,17 @@ static HRESULT direct_create(COORD size, HANDLE input, HANDLE output,
         goto failed;
     /* The child waits on this before exiting; see uu_terminal_proxy.c. */
     SetEnvironmentVariableW(L"UURB_CONPTY_SESSION_EVENT", event_name);
-    session.threads[0] = CreateThread(NULL, 0, input_pump, NULL, 0, NULL);
-    session.threads[1] = CreateThread(NULL, 0, output_pump, NULL, 0, NULL);
-    session.threads[2] = CreateThread(NULL, 0, console_drain, NULL, 0, NULL);
+    /* Small stacks: the pumps only shuffle buffers (default 1 MB reserve
+     * per thread is pure VA pressure on low-memory hosts). */
+    session.threads[0] = CreateThread(NULL, 256 * 1024, input_pump, NULL, 0, NULL);
+    session.threads[1] = CreateThread(NULL, 256 * 1024, output_pump, NULL, 0, NULL);
+    session.threads[2] = CreateThread(NULL, 256 * 1024, console_drain, NULL, 0, NULL);
+    for (int index = 0; index < 3; index++) {
+        if (session.threads[index] == NULL) {
+            trace("thread_create_failed", GetLastError());
+            goto failed;
+        }
+    }
     *console = session.console;
     return S_OK;
 
@@ -450,9 +492,18 @@ void WINAPI shim_close(pseudo_console console)
         close_handle(&session.bridge_input);
         close_handle(&session.bridge_output);
         close_handle(&session.console_input);
-        WaitForMultipleObjects(3, session.threads, TRUE, 2000);
-        for (int index = 0; index < 3; index++)
-            close_handle(&session.threads[index]);
+        {
+            HANDLE live[3];
+            int live_count = 0;
+
+            for (int index = 0; index < 3; index++)
+                if (session.threads[index] != NULL)
+                    live[live_count++] = session.threads[index];
+            if (live_count > 0)
+                WaitForMultipleObjects((DWORD)live_count, live, TRUE, 2000);
+            for (int index = 0; index < 3; index++)
+                close_handle(&session.threads[index]);
+        }
         close_handle(&session.console_output);
         session.console = NULL;
     }
