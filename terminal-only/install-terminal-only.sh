@@ -108,10 +108,9 @@ wine_prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu
 log "启动桥并自检"
 systemctl --user restart uu-remote-bridge.service
 runtime_file="/run/user/$(id -u)/uu-remote-bridge/terminal.port"
-ready=false
 for _ in {1..60}; do
     systemctl --user is-active --quiet uu-remote-bridge.service || break
-    [[ -s "$runtime_file" ]] && ready=true && break
+    [[ -s "$runtime_file" ]] && break
     sleep 0.5
 done
 if systemctl --user is-active --quiet uu-remote-bridge.service; then
