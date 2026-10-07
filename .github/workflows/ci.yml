@@ -17,20 +17,20 @@ jobs:
         run: find . -name '*.sh' -type f -print0 | xargs -0 shellcheck --severity=error
 
       - name: shellcheck — terminal-only kit (warning severity)
-        run: shellcheck --severity=warning uu-remote-ubuntu-plus/terminal-only/*.sh
+        run: shellcheck --severity=warning terminal-only/*.sh
 
       - name: bash syntax check
         run: find . -name '*.sh' -type f -print0 | xargs -0 -n1 bash -n
 
       - name: python compile
-        run: python3 -m compileall -q uu-remote-ubuntu-plus/scripts uu-remote-ubuntu-plus/tests
+        run: python3 -m compileall -q scripts tests
 
       - name: patch manifests are valid JSON
         run: |
           python3 - <<'PY'
           import json, pathlib, sys
           failures = []
-          manifests = sorted(pathlib.Path("uu-remote-ubuntu-plus/patches").glob("*.json"))
+          manifests = sorted(pathlib.Path("patches").glob("*.json"))
           for path in manifests:
               try:
                   json.loads(path.read_text(encoding="utf-8"))
@@ -63,9 +63,10 @@ jobs:
       #       host instead
       #   test_update_manager
       #     — uu_update_manager refuses to run outside a git repository, and
-      #       upstream lives flattened in a subdirectory without its own .git
+      #       this checkout's tests run from tests/ while the probe layout it
+      #       expects mirrors the upstream nested tree
       - name: Run environment-independent unittest modules
-        working-directory: uu-remote-ubuntu-plus/tests
+        working-directory: tests
         run: |
           EXCLUDED="test_console_focus test_display_modes test_manager_capture test_x11_child_reaping test_x11_live_geometry test_update_manager"
           MODULES=""
