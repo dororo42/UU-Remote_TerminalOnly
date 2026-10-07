@@ -1442,6 +1442,19 @@ start_terminal_bridge() {
         log 'The psmux PowerShell proxy is inactive; psmux-path terminals stay unsupported.'
     fi
     config_temporary="${terminal_config_file}.$$.tmp"
+    # A previous crash can leave the ready file behind, and the broker's
+    # link-publish refuses to replace an existing path. Take over a stale
+    # file only when its recorded port is no longer listening and the file
+    # is ours; anything else stays fail-closed.
+    if [[ -f "$terminal_ready_file" ]]; then
+        stale_port="$(head -n 2 "$terminal_ready_file" | tail -n 1 |
+            tr -dc '0-9')"
+        if [[ -n "$stale_port" ]] &&
+           ! /usr/bin/ss -tln "sport = :$stale_port" 2>/dev/null | grep -q ":$stale_port "; then
+            log "Removing a stale terminal ready file (port $stale_port is not listening)."
+            rm -f -- "$terminal_ready_file"
+        fi
+    fi
     rm -f \
         "$terminal_ready_file" \
         "$terminal_config_file" \

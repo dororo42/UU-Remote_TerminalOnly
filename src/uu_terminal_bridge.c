@@ -359,15 +359,30 @@ static int read_handshake(int client, const char *expected_token,
     memset(supplied_token, 0, sizeof(supplied_token));
     if (reject_reason == NULL &&
         ntohs(hello.version) == UURB_TERMINAL_VERSION_SESSION) {
-        if (read_exact_deadline(client, &session, sizeof(session), deadline) != 1 ||
-            read_exact_deadline(client, result->name, session.name_length,
-                                deadline) != 1)
+        /* Validate the announced length before reading the name into the
+         * fixed stack buffer: name_length arrives from the wire (0-255) and
+         * result->name holds MAX_SESSION_NAME+1 bytes. */
+        if (read_exact_deadline(client, &session, sizeof(session), deadline) != 1)
             reject_reason = "session_read";
         else if ((session.role != UURB_TERMINAL_ROLE_ATTACH &&
                   session.role != UURB_TERMINAL_ROLE_ANCHOR) ||
-                 !session_name_is_valid(result->name, session.name_length))
+                 session.name_length == 0 ||
+                 session.name_length > UURB_TERMINAL_MAX_SESSION_NAME) {
+            unsigned char discard_name[256];
             reject_reason = "session";
-        result->role = session.role;
+            /* Drain the announced name so the close lands as a FIN, not an
+             * RST — clients treat a clean close as a rejection signal. */
+            if (session.name_length > 0)
+                read_exact_deadline(client, discard_name,
+                                    session.name_length, deadline);
+        }
+        else if (read_exact_deadline(client, result->name, session.name_length,
+                                     deadline) != 1)
+            reject_reason = "session_read";
+        else if (!session_name_is_valid(result->name, session.name_length))
+            reject_reason = "session";
+        else
+            result->role = session.role;
     }
     if (reject_reason != NULL) {
         fprintf(stderr, "rejected terminal bridge handshake reason=%s\n", reject_reason);

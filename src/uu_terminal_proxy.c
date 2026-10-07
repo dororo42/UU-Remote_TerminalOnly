@@ -152,13 +152,35 @@ static void write_error(const char *message)
     }
 }
 
+/* Outbound frames share one socket: a stalled viewer side must not hold
+ * send_frame's critical section forever, and it must not starve resize or
+ * control frames. Bound every wait; on timeout the connection is broken for
+ * every sender, so trace and terminate — UU relaunches the terminal. */
+static int wait_socket_writable(int seconds)
+{
+    fd_set writable;
+    struct timeval timeout;
+
+    FD_ZERO(&writable);
+    FD_SET(terminal_socket, &writable);
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = 0;
+    return select(0, NULL, &writable, NULL, &timeout) > 0;
+}
+
 static int send_all(const void *buffer, size_t size)
 {
     const char *cursor = (const char *)buffer;
 
     while (size > 0) {
         int chunk = size > INT_MAX ? INT_MAX : (int)size;
-        int sent = send(terminal_socket, cursor, chunk, 0);
+        int sent;
+
+        if (!wait_socket_writable(5)) {
+            trace_event("send_stalled_terminating");
+            ExitProcess(1);
+        }
+        sent = send(terminal_socket, cursor, chunk, 0);
 
         if (sent <= 0)
             return 0;
@@ -257,6 +279,22 @@ static DWORD WINAPI input_worker(LPVOID unused)
 
     (void)unused;
     while (WaitForSingleObject(stop_event, 0) == WAIT_TIMEOUT) {
+        DWORD pending = 0;
+
+        /* Wine cannot wake a blocking console ReadFile with
+         * CancelSynchronousIo; poll the pending count so stop_event is
+         * honored between input bursts. */
+        if (!GetNumberOfConsoleInputEvents(input, &pending)) {
+            if (GetLastError() != ERROR_INVALID_HANDLE) {
+                trace_error("input_pending_failed", GetLastError());
+                send_frame(UURB_TERMINAL_FRAME_EOF, NULL, 0);
+                return 0;
+            }
+        } else if (pending == 0) {
+            if (WaitForSingleObject(stop_event, 50) != WAIT_TIMEOUT)
+                return 0;
+            continue;
+        }
         if (!ReadFile(input, buffer, sizeof(buffer), &received, NULL)) {
             trace_error("input_read_failed", GetLastError());
             send_frame(UURB_TERMINAL_FRAME_EOF, NULL, 0);
@@ -951,6 +989,23 @@ static int run_mux_script(const wchar_t *script, size_t length)
  * lives while UU keeps the pane, and the pane ends with the shell, as a
  * native pane would. Returns 0 when there is no such session, so the pane
  * runs its own shell. */
+/* The anchor socket has no send_all loop yet — finish partial sends instead
+ * of failing the whole anchor on a legal WSA partial write. */
+static int send_anchor_block(SOCKET anchor, const void *data, int length)
+{
+    const char *cursor = data;
+
+    while (length > 0) {
+        int sent = send(anchor, cursor, length, 0);
+
+        if (sent <= 0)
+            return 0;
+        cursor += sent;
+        length -= sent;
+    }
+    return 1;
+}
+
 static int anchor_session(const char *token, uint16_t port, const char *name)
 {
     struct uurb_terminal_hello hello;
@@ -977,10 +1032,10 @@ static int anchor_session(const char *token, uint16_t port, const char *name)
     session.role = UURB_TERMINAL_ROLE_ANCHOR;
     session.name_length = (uint8_t)length;
     if (connect(anchor, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        send(anchor, (const char *)&hello, sizeof(hello), 0) != sizeof(hello) ||
-        send(anchor, token, UURB_TERMINAL_TOKEN_LENGTH, 0) != UURB_TERMINAL_TOKEN_LENGTH ||
-        send(anchor, (const char *)&session, sizeof(session), 0) != sizeof(session) ||
-        send(anchor, name, (int)length, 0) != (int)length ||
+        !send_anchor_block(anchor, &hello, sizeof(hello)) ||
+        !send_anchor_block(anchor, token, UURB_TERMINAL_TOKEN_LENGTH) ||
+        !send_anchor_block(anchor, &session, sizeof(session)) ||
+        !send_anchor_block(anchor, name, (int)length) ||
         recv(anchor, (char *)&accepted, 1, 0) != 1 ||
         accepted != UURB_TERMINAL_ACCEPTED) {
         closesocket(anchor);

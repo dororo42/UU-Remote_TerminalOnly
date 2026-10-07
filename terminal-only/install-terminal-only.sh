@@ -90,8 +90,9 @@ cd "$repo_dir"
     --no-start
 
 log "部署 conpty shim 到 prefix compat"
+wine_prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu-remote}}"
 /usr/bin/install -m 0644 build/compat/uu-conpty.dll \
-    "$HOME/.local/share/wineprefixes/uu-remote/compat/uu-conpty.dll"
+    "$wine_prefix/compat/uu-conpty.dll"
 
 # ── 4. 部署后自检 ───────────────────────────────────────────
 log "启动桥并自检"

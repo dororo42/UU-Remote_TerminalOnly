@@ -217,6 +217,22 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
             pass
         return True
 
+    def test_oversized_session_name_is_rejected_and_broker_survives(self):
+        # The wire carries name_length as a byte; a handshake announcing 65+
+        # bytes for a 65-byte stack buffer must be rejected on the length
+        # check BEFORE the read, and the broker must survive the attempt.
+        port = self.start()
+        for announce in (65, 255):
+            client = socket.create_connection(("127.0.0.1", port), timeout=5)
+            client.sendall(struct.pack("!IHHHH", MAGIC, 2, TOKEN_LENGTH, 80, 24) +
+                           self.token.encode() + struct.pack("!BB", 2, announce) +
+                           b"A" * announce)
+            closed = self.closed(client, timeout=3)
+            self.assertTrue(closed, f"handshake with name_length={announce} was not rejected")
+        survivor = self.connect(port, self.ATTACH, "session1")
+        self.assertIsNotNone(survivor)
+        survivor.close()
+
     def test_viewer_returns_to_the_same_shell_while_anchored(self):
         port = self.start()
         first = self.connect(port, self.ATTACH, "session1")

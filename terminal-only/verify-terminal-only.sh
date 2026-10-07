@@ -50,11 +50,18 @@ else
 fi
 
 echo "── 4. 终端桥组件 ──"
-wine_prefix="${WINEPREFIX:-$HOME/.uu-remote-bridge/prefix}"
+wine_prefix="${UURB_WINEPREFIX:-${WINEPREFIX:-$HOME/.local/share/wineprefixes/uu-remote}}"
 if [[ -f "$repo_dir/bin/uu-terminal-proxy.exe" || -n "$(find "$repo_dir" "$wine_prefix" -maxdepth 4 -name 'uu-terminal-proxy.exe' 2>/dev/null | head -1)" ]]; then
     ok "uu-terminal-proxy.exe 已安装"
 else
     warn "未定位到 uu-terminal-proxy.exe（路径可能不同，test-terminal-bridge.sh 会给出权威结论）"
+fi
+shim_dll="$wine_prefix/compat/uu-conpty.dll"
+conpty_dll="$wine_prefix/drive_c/Program Files/Netease/GameViewer/bin/conpty.dll"
+if [[ -f "$shim_dll" && -f "$conpty_dll" ]] && cmp -s "$shim_dll" "$conpty_dll"; then
+    ok "conpty.dll shim 已部署"
+else
+    warn "conpty.dll shim 未部署/不一致（broker 启动时会重新部署；无 shim 则终端不可用）"
 fi
 
 echo "── 5. 资源画像 ──"

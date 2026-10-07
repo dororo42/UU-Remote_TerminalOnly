@@ -215,6 +215,32 @@ static size_t bridge_session_name(char *name, size_t size)
     return length;
 }
 
+/* Loopback sends are usually atomic, but a partial send is legal under
+ * WSA under load — finish it instead of failing the whole handshake. */
+static int send_all_socket(SOCKET socket, const void *data, int length)
+{
+    const char *cursor = data;
+    DWORD deadline = GetTickCount() + 5000;
+
+    while (length > 0) {
+        int sent = send(socket, cursor, length, 0);
+
+        if (sent == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+
+            if ((error == WSAEINTR || error == WSAEWOULDBLOCK) &&
+                GetTickCount() < deadline) {
+                Sleep(5);
+                continue;
+            }
+            return 0;
+        }
+        cursor += sent;
+        length -= sent;
+    }
+    return 1;
+}
+
 static SOCKET connect_broker(COORD size)
 {
     struct sockaddr_in address;
@@ -247,11 +273,11 @@ static SOCKET connect_broker(COORD size)
     hello.rows = htons((uint16_t)(size.Y > 0 ? size.Y : 24));
     if (connection == INVALID_SOCKET ||
         connect(connection, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        send(connection, (const char *)&hello, sizeof(hello), 0) != sizeof(hello) ||
-        send(connection, token, UURB_TERMINAL_TOKEN_LENGTH, 0) != UURB_TERMINAL_TOKEN_LENGTH ||
+        !send_all_socket(connection, &hello, sizeof(hello)) ||
+        !send_all_socket(connection, token, UURB_TERMINAL_TOKEN_LENGTH) ||
         (name_length > 0 &&
-         (send(connection, (const char *)&session, sizeof(session), 0) != sizeof(session) ||
-          send(connection, name, (int)name_length, 0) != (int)name_length)) ||
+         (!send_all_socket(connection, &session, sizeof(session)) ||
+          !send_all_socket(connection, name, (int)name_length))) ||
         (received = recv(connection, (char *)&accepted, 1, 0)) != 1 ||
         accepted != UURB_TERMINAL_ACCEPTED) {
         if (connection != INVALID_SOCKET)
@@ -408,10 +434,19 @@ void WINAPI shim_close(pseudo_console console)
 
     trace("close", console != NULL && console == session.console);
     if (console != NULL && console == session.console) {
-        /* Hanging up the socket ends the Linux shell. */
+        /* Hanging up the socket ends the Linux shell. Signal the pumps,
+         * then end the console host BEFORE waiting: the console host owns
+         * the pipe write ends, and console_drain cannot see EOF until they
+         * close — waiting first would burn the full 2 s every time. */
         shutdown(session.socket, SD_BOTH);
         closesocket(session.socket);
         SetEvent(session.done);
+    }
+    if (close != NULL && console != NULL) {
+        close(console);
+        console = NULL;
+    }
+    if (console == NULL && session.console != NULL) {
         close_handle(&session.bridge_input);
         close_handle(&session.bridge_output);
         close_handle(&session.console_input);
@@ -421,6 +456,4 @@ void WINAPI shim_close(pseudo_console console)
         close_handle(&session.console_output);
         session.console = NULL;
     }
-    if (close != NULL)
-        close(console);
 }
