@@ -1043,20 +1043,35 @@ static int anchor_session(const char *token, uint16_t port, const char *name)
         return 0;
     }
     trace_event("anchor_held");
-    /* Bound the hold: if the broker wedges without closing the anchor, the
-     * pane proxy must not leak forever. */
+    /* The anchor carries no traffic: the broker closes it when the session
+     * ends, so every read on a healthy hold times out. Poll instead of
+     * letting one timeout end the hold, and bound the wait to one day (the
+     * same ceiling as wait_direct_session) so a wedged broker cannot wedge
+     * this process forever. */
     {
-        DWORD rcv_timeout_ms = 5000;
+        DWORD rcv_timeout_ms = 60000;
+        DWORD start = GetTickCount();
+        int expired = 0;
 
         setsockopt(anchor, SOL_SOCKET, SO_RCVTIMEO,
                    (const char *)&rcv_timeout_ms, sizeof(rcv_timeout_ms));
+        for (;;) {
+            int received = recv(anchor, discard, sizeof(discard), 0);
+
+            if (received > 0)
+                continue;
+            if (received == 0 || WSAGetLastError() != WSAETIMEDOUT)
+                break;
+            if (GetTickCount() - start > 24LL * 60 * 60 * 1000) {
+                expired = 1;
+                break;
+            }
+        }
+        if (expired)
+            trace_event("anchor_hold_timeout");
+        else
+            trace_event("anchor_released");
     }
-    while (recv(anchor, discard, sizeof(discard), 0) > 0)
-        ;
-    if (WSAGetLastError() == WSAETIMEDOUT)
-        trace_event("anchor_hold_timeout");
-    else
-        trace_event("anchor_released");
     closesocket(anchor);
     return 1;
 }

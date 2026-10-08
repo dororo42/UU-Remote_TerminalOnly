@@ -27,7 +27,7 @@ token、端口、句柄值以外的句柄、终端字节)。排障时把三个�
 | `mux_script[N] <text>` | 控制端发来的启动脚本全文(分块,仅含 uuyc-mux/chcp) | 每会话 1 组 |
 | `mux_step exit=<code>` | 脚本中一条 uuyc-mux 语句执行完成 | new 一条、set-option/rename 各一条、attach 常驻 |
 | `anchor_held` | 面板 shell 以 ANCHOR 角色锚定持久会话 | 每会话 1 次;**之后消失且无 anchor_released = 进程被硬杀**(PC 树清理) |
-| `anchor_hold_timeout` | 桥 5s 未关锚连接(桥停滞) | 正常 **0** |
+| `anchor_hold_timeout` | 锚持有超过 24h 硬上限(桥长期停滞;健康空闲锚不会被断,60s 空闲超时仅用于轮询唤醒) | 正常 **0** |
 | `anchor_released` | 桥端正常关闭锚连接(会话结束) | 会话结束时 1 次 |
 | `anchor_busy` | broker 回 BUSY(0x07):会话/锚定名额已满 | 正常 **0** |
 | `unsupported_command` | UU 的 visible-attach helper 被设计内拒绝,UU 转向 cmd 候选 | PC 每次尝试 1 次(设计内) |
