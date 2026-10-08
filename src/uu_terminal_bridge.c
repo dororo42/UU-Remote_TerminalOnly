@@ -587,8 +587,21 @@ static int relay_transient(int client, struct winsize initial_size)
         if (descriptors[1].revents & POLLIN) {
             ssize_t size = read(pty_master, payload, sizeof(payload));
 
-            if (size <= 0 || !send_all_viewer(client, payload, (size_t)size))
+            if (size <= 0)
                 break;
+            /* Version 1 is the path the Windows shim actually takes (no
+             * session name), so the OSC 3008 strip must happen here too —
+             * filtering hold_session alone left the transient stream
+             * polluted with literal-text context signalling. */
+            {
+                unsigned char filtered[sizeof(payload) + 16];
+                size_t filtered_len = osc3008_filter_chunk(
+                    payload, (size_t)size, filtered);
+
+                if (filtered_len > 0 &&
+                    !send_all_viewer(client, filtered, filtered_len))
+                    break;
+            }
         }
         if ((descriptors[0].revents & POLLIN) &&
             !relay_client_frame(client, pty_master, 0))

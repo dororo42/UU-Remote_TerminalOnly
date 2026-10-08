@@ -153,9 +153,51 @@ class NativeTerminalBrokerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.ready.exists())
 
+    def test_osc3008_is_stripped_on_v1_transient_path(self):
+        # The Windows shim connects without a session name, so UU terminals
+        # take the version-1 transient path. Regression for the release where
+        # the strip lived only in hold_session (v2) and every prompt still
+        # carried systemd's context signalling to the UU panel.
+        port = self.start()
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(self.hello() + self.token.encode())
+        self.assertEqual(client.recv(1), b"\x06")
+        # The profile hook emits 3008 around every prompt; wait for the
+        # initial prompt, then force fresh sequences via PS0/precmd.
+        deadline = time.monotonic() + 8
+        received = b""
+        while time.monotonic() < deadline:
+            client.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                chunk = client.recv(65536)
+            except (socket.timeout, ConnectionError):
+                break
+            if not chunk:
+                break
+            received += chunk
+            if b"$" in received or b"#" in received:
+                break
+        keystrokes = b"echo ok\r\n"
+        client.sendall(struct.pack("!B3xI", 1, len(keystrokes)) + keystrokes)
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            client.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                chunk = client.recv(65536)
+            except (socket.timeout, ConnectionError):
+                break
+            if not chunk:
+                break
+            received += chunk
+            if b"ok\r\n" in received:
+                break
+        client.close()
+        self.assertIn(b"echo ok", received)
+        self.assertNotIn(b"machineid=", received)
+        self.assertNotIn(b"type=shell", received)
+        self.assertNotIn(b"]3008;", received)
 
-if __name__ == "__main__":
-    unittest.main()
+
 
 
 class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
@@ -356,3 +398,6 @@ class PersistentTerminalSessionTests(NativeTerminalBrokerTests):
         port = self.start()
         for name in ("", ".hidden", "a/b", "x" * 65):
             self.assertIsNone(self.connect(port, self.ATTACH, name), name)
+
+if __name__ == "__main__":
+    unittest.main()
