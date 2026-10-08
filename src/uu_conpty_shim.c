@@ -292,6 +292,7 @@ static SOCKET connect_broker(COORD size)
 
     if (!load_broker(&port, token) || WSAStartup(MAKEWORD(2, 2), &winsock) != 0)
         return INVALID_SOCKET;
+    trace("session_name", (DWORD)name_length);
     connection = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;

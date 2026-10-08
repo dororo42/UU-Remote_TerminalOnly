@@ -9,6 +9,7 @@ token、端口、句柄值以外的句柄、终端字节)。排障时把三个�
 | 事件 | 含义 | 期望频次 |
 |---|---|---|
 | `create_flags <flags>` | CreatePseudoConsole 被调用;flags=7 含 INHERIT_CURSOR(shim 会丢弃该标志) | 每会话 1 次 |
+| `session_name <len>` | 从 conpty_bridge 命令行解析到的 `--uuyc-mux-session` 名字长度;0=无名(走 v1 临时会话) | 每会话 1 次 |
 | `direct_session <cols<<16\|rows>` | 已连上 PTY broker(ATTACH 角色);值为控制台尺寸 | 每会话 1 次 |
 | `resize <cols<<16\|rows>` | 控制端调整窗口尺寸 | 用户拖拽时 |
 | `wine_fallback <hresult>` | broker 不可达,回退 Wine 原生 pseudoconsole(终端将不可用) | 正常 **0**;>0 = 桥/网络问题 |
