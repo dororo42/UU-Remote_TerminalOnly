@@ -242,36 +242,38 @@ static int send_all_socket(SOCKET socket, const void *data, int length)
 }
 
 /* Loopback connects instantly; bound it anyway so a wedged WSA stack
- * degrades to the Wine fallback instead of hanging the terminal open. */
+ * degrades to the Wine fallback instead of hanging the terminal open.
+ * Returns nonzero when the connection is established. */
 static int connect_with_deadline(SOCKET connection,
                                  const struct sockaddr *address,
                                  int length)
 {
     u_long nonblocking = 1;
+    int established = 0;
     int result;
 
     ioctlsocket(connection, FIONBIO, &nonblocking);
     result = connect(connection, address, length);
-    if (result == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+    if (result == 0) {
+        established = 1;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
         fd_set writable;
         struct timeval timeout = {2, 0};
 
         FD_ZERO(&writable);
         FD_SET(connection, &writable);
-        if (select(0, NULL, &writable, NULL, &timeout) <= 0) {
-            result = SOCKET_ERROR;
-        } else {
+        if (select(0, NULL, &writable, NULL, &timeout) > 0) {
             int so_error = 0;
             int size = (int)sizeof(so_error);
 
             getsockopt(connection, SOL_SOCKET, SO_ERROR, (char *)&so_error,
                        &size);
-            result = so_error != 0 ? SOCKET_ERROR : 0;
+            established = so_error == 0;
         }
     }
     nonblocking = 0;
     ioctlsocket(connection, FIONBIO, &nonblocking);
-    return result;
+    return established;
 }
 
 static SOCKET connect_broker(COORD size)
