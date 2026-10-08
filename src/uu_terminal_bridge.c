@@ -372,7 +372,9 @@ static size_t osc3008_filter_chunk(const unsigned char *in, size_t len,
                 } else if (c == '\\') {
                     emit = 0;                           /* ST completed, dropped */
                 } else {
-                    /* Spec-impossible: treat as resumed content. */
+                    /* Spec-impossible: treat as resumed content, restoring
+                     * the held ESC so no original byte is dropped. */
+                    out[out_index++] = 0x1b;
                 }
             } else if (c == 0x07) {
                 osc3008_reset();                        /* BEL terminator */
