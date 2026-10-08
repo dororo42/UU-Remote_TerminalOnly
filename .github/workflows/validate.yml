@@ -52,9 +52,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64-win32 \
+            cppcheck \
             wine wine64 wine64-tools \
             openbox python3-gi python3-xlib tigervnc-viewer x11vnc \
             x11-utils x11-xserver-utils xclip xcompmgr xdotool xvfb
+
+      # Gate the terminal C sources (bridge/proxy/shim) on the same checks
+      # that are clean locally, so boundary-class regressions surface in CI.
+      - name: Static analysis (cppcheck)
+        run: |
+          cppcheck --enable=warning,performance,portability \
+            --std=c11 --platform=unix64 --error-exitcode=1 \
+            src/uu_terminal_bridge.c src/uu_terminal_proxy.c \
+            src/uu_conpty_shim.c
 
       # Environment-dependent modules (Xvfb fixtures, Wine sessions, the
       # git-root-probing update manager) are exercised on a real deployment
